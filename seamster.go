@@ -46,9 +46,9 @@ type Seamster struct {
 	// maps, so a production host pays one bool read per site. Set once at construction and never mutated.
 	enabled bool
 
-	// mu guards faults, waitFors, and breakpoints together. One lock keeps the arm/consult/wake operations
-	// across both seams mutually consistent - e.g. Checkpoint waking waiters and marking a breakpoint hit under
-	// a single hold.
+	// mu guards faults, waitFors, breakpoints, and visits together. One lock keeps the arm/consult/wake
+	// operations across both seams mutually consistent - e.g. Checkpoint bumping the visit count, waking
+	// waiters, and marking a breakpoint hit under a single hold.
 	mu sync.Mutex
 
 	// faults maps an armed fault key to its remaining fire count. A key is the fault name plus any scope,
@@ -60,6 +60,10 @@ type Seamster struct {
 
 	// breakpoints holds armed Break(name) freezes, released by Resume(name).
 	breakpoints map[string]*breakpoint
+
+	// visits counts how many times the host has passed each named checkpoint, bumped by Checkpoint and read
+	// by Visits. Monotonic for the Seamster's lifetime - never reset.
+	visits map[string]int
 }
 
 // New returns a Seamster. When enabled is false every consult is inert, so a host passes its own under-test

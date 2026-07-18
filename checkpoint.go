@@ -29,6 +29,9 @@ import "context"
 //     debugger breakpoint for the host - arm it, let the host run into it and block, do whatever the test needs
 //     while the host is frozen, then clear to release it.
 //
+// A third, passive observation needs no arming: Visits(name) reports how many times the host has passed the
+// checkpoint - a plain counter for assertions ("the retry ran exactly 3 times"), never blocking.
+//
 // The two compose to drive a concurrent operation into a precise window deterministically, with no timing hammer:
 // Break(name); start the host op in a goroutine; Wait(name) (returns once the host is frozen at the
 // breakpoint); run the racing op while the host is held; Resume(name) to release. Wait returns
@@ -53,6 +56,10 @@ func (s *Seamster) Checkpoint(ctx context.Context, checkpointName string) {
 		return
 	}
 	s.mu.Lock()
+	if s.visits == nil {
+		s.visits = make(map[string]int)
+	}
+	s.visits[checkpointName]++
 	for _, ch := range s.waitFors[checkpointName] {
 		close(ch)
 	}
@@ -107,6 +114,21 @@ func (s *Seamster) Break(checkpointName string) {
 	}
 	s.breakpoints[checkpointName] = &breakpoint{release: make(chan struct{}), hit: make(chan struct{})}
 	s.mu.Unlock()
+}
+
+// Visits reports how many times the host has passed the named checkpoint - each Checkpoint(name) call counts
+// one, including a call that then blocked on a breakpoint (reaching the checkpoint is the visit; blocking comes
+// after). It is a passive counter for assertions: it never blocks, consumes nothing, and can be read repeatedly.
+// The count is monotonic for the Seamster's lifetime (never reset), so capture a baseline first if a test asserts
+// on visits accrued only within a window. Zero for a checkpoint never reached, and always zero on a disabled
+// Seamster (Checkpoint counts nothing when inert).
+func (s *Seamster) Visits(checkpointName string) int {
+	if !s.enabled {
+		return 0
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.visits[checkpointName]
 }
 
 // Resume releases the host frozen at the named breakpoint and disarms it. A no-op if none is armed.

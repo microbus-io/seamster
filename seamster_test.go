@@ -138,6 +138,44 @@ func TestSeamster_BreakpointFreezeAndRelease(t *testing.T) {
 	}
 }
 
+func TestSeamster_VisitsCountsCheckpointArrivals(t *testing.T) {
+	s := New(true)
+	ctx := context.Background()
+
+	if got := s.Visits("cp"); got != 0 {
+		t.Fatalf("expected 0 visits before any arrival, got %d", got)
+	}
+	for i := 1; i <= 3; i++ {
+		s.Checkpoint(ctx, "cp")
+		if got := s.Visits("cp"); got != i {
+			t.Fatalf("after %d arrivals expected %d visits, got %d", i, i, got)
+		}
+	}
+	// Distinct names count independently, and reading does not consume.
+	if got := s.Visits("other"); got != 0 {
+		t.Fatalf("unrelated checkpoint should have 0 visits, got %d", got)
+	}
+	if got := s.Visits("cp"); got != 3 {
+		t.Fatalf("Visits is a passive read; expected 3 still, got %d", got)
+	}
+
+	// A visit is counted even when the arrival then blocks on a breakpoint.
+	s.Break("cp")
+	go s.Checkpoint(ctx, "cp") // reaches the checkpoint (counted), then blocks
+	s.Wait("cp")               // returns once frozen at the breakpoint
+	if got := s.Visits("cp"); got != 4 {
+		t.Fatalf("a breakpoint-blocked arrival should still count; expected 4, got %d", got)
+	}
+	s.Resume("cp")
+
+	// Disabled Seamster counts nothing.
+	d := New(false)
+	d.Checkpoint(ctx, "cp")
+	if got := d.Visits("cp"); got != 0 {
+		t.Fatalf("disabled Seamster should report 0 visits, got %d", got)
+	}
+}
+
 func TestSeamster_CheckpointReleasesOnContextCancel(t *testing.T) {
 	s := New(true)
 	s.Break("cp")

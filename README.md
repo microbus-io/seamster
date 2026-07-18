@@ -8,9 +8,9 @@ It has two halves:
 
 - **Fault injection** makes a site *misbehave*. A test arms a named fault; the host consults it at the exact point
   it affects and simulates an error, drop, or stale write that is otherwise hard to trigger on demand.
-- **Execution checkpoints** make a site *observable and pausable*. A test rendezvouses with the host's progress, or
-  freezes the host at an exact point, so a concurrent operation can be driven into a precise window with no timing
-  hammer.
+- **Execution checkpoints** make a site *observable and pausable*. A test rendezvouses with the host's progress,
+  freezes the host at an exact point (so a concurrent operation can be driven into a precise window with no timing
+  hammer), or simply counts how many times the host has passed the point.
 
 Both are **inert in production by construction**: every consult short-circuits on the `enabled` bool the host
 passes to `New` (typically `testing.Testing()`), so a disabled `Seamster` pays a single lock-free bool read per
@@ -60,6 +60,11 @@ go h.Process(ctx)          // runs into the breakpoint and blocks
 h.seams.Wait("beforeTransitionTx")  // returns once frozen
 // ... run the racing operation while the host is held ...
 h.seams.Resume("beforeTransitionTx")
+
+// Count: assert how many times the host passed a checkpoint.
+if h.seams.Visits("beforeTransitionTx") != 3 {
+    t.Fatalf("expected 3 attempts, got %d", h.seams.Visits("beforeTransitionTx"))
+}
 ```
 
 ## API
@@ -72,10 +77,11 @@ h.seams.Resume("beforeTransitionTx")
 | `Inject(name, scope...)` | test | Arm a fault once (additive); scope args match `IsFault`. |
 | `InjectN(n, name, scope...)` | test | Arm a fault n times (additive); scope args match `IsFault`. |
 | `Withdraw(name, scope...)` | test | Disarm a fault. |
-| `Checkpoint(ctx, name)` | host | Pass through a checkpoint; wakes waiters, honors a breakpoint. |
+| `Checkpoint(ctx, name)` | host | Pass through a checkpoint; counts the visit, wakes waiters, honors a breakpoint. |
 | `Wait(name)` | test | Block until the host next reaches the checkpoint. |
 | `Break(name)` | test | Freeze the host at the checkpoint. |
 | `Resume(name)` | test | Unfreeze the host at the checkpoint. |
+| `Visits(name) int` | test | Count how many times the host has passed the checkpoint (monotonic; never blocks). |
 
 Scoping: a fault is usually scoped so a test targets one entity rather than "the next thing that happens." The
 consult passes the scope to `IsFault`; the test arms the fault with the same scope args (`Inject`/`InjectN`/
