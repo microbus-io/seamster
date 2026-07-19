@@ -138,6 +138,47 @@ func TestSeamster_BreakpointFreezeAndRelease(t *testing.T) {
 	}
 }
 
+func TestSeamster_BreakpointHoldsConcurrentArrivals(t *testing.T) {
+	s := New(true)
+	s.Break("cp")
+
+	const goroutines = 8
+	released := make(chan struct{}, goroutines)
+	var wg sync.WaitGroup
+	for range goroutines {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			s.Checkpoint(context.Background(), "cp") // every arrival freezes, none panics on a double close
+			released <- struct{}{}
+		}()
+	}
+
+	// Wait returns as soon as the first of the fan-out arrives.
+	s.Wait("cp")
+	select {
+	case <-released:
+		t.Fatal("a goroutine proceeded past the breakpoint before it was cleared")
+	case <-time.After(20 * time.Millisecond):
+	}
+
+	// One Resume releases the whole fan-out.
+	s.Resume("cp")
+	done := make(chan struct{})
+	go func() {
+		wg.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatalf("only %d of %d goroutines proceeded after the breakpoint was cleared", len(released), goroutines)
+	}
+	if got := s.Visits("cp"); got != goroutines {
+		t.Fatalf("expected %d visits, got %d", goroutines, got)
+	}
+}
+
 func TestSeamster_VisitsCountsCheckpointArrivals(t *testing.T) {
 	s := New(true)
 	ctx := context.Background()
@@ -201,7 +242,7 @@ func TestSeamster_ConcurrentArmAndConsult(t *testing.T) {
 	// Exercised under -race: arming and consulting from many goroutines must not race.
 	s := New(true)
 	var wg sync.WaitGroup
-	for i := 0; i < 50; i++ {
+	for range 50 {
 		wg.Add(2)
 		go func() { defer wg.Done(); s.Inject("boom") }()
 		go func() { defer wg.Done(); s.IsFault("boom") }()

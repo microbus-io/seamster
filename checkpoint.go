@@ -40,10 +40,15 @@ import "context"
 
 // breakpoint is one armed breakpoint: release is closed by Resume to let the frozen host proceed; hit is
 // closed by the host (under the lock) when it reaches the checkpoint and is about to block, so a Wait that
-// arrives after the host froze still observes the arrival instead of hanging.
+// arrives after the host froze still observes the arrival instead of hanging. A breakpoint holds every
+// goroutine that reaches it, not just the first, so hitClosed (guarded by Seamster.mu) records whether hit has
+// already been closed - concurrent arrivals must not close it twice.
 type breakpoint struct {
 	release chan struct{}
 	hit     chan struct{}
+	// hitClosed guards against a double close of hit when several goroutines reach the same armed checkpoint
+	// concurrently. Read and written only under Seamster.mu.
+	hitClosed bool
 }
 
 // Checkpoint is the host-side consult at an instrumented site. Free in production (returns on the enabled bool
@@ -65,8 +70,11 @@ func (s *Seamster) Checkpoint(ctx context.Context, checkpointName string) {
 	}
 	delete(s.waitFors, checkpointName)
 	bp := s.breakpoints[checkpointName]
-	if bp != nil {
-		close(bp.hit) // one-shot: Resume deletes the entry, so a re-arrival reaching here finds bp==nil
+	if bp != nil && !bp.hitClosed {
+		// First arrival marks the breakpoint hit; later arrivals (concurrent ones racing this same lock hold, or
+		// sequential ones before Resume disarms the entry) just join the freeze without re-closing hit.
+		bp.hitClosed = true
+		close(bp.hit)
 	}
 	s.mu.Unlock()
 
@@ -103,7 +111,9 @@ func (s *Seamster) Wait(checkpointName string) {
 }
 
 // Break arms a breakpoint so the host blocks the next time it reaches the named checkpoint, until
-// Resume releases it.
+// Resume releases it. The breakpoint holds every goroutine that reaches the checkpoint while it is armed, not
+// only the first, so a fan-out can be gathered at one point and released together by a single Resume; Wait
+// returns as soon as the first of them arrives.
 func (s *Seamster) Break(checkpointName string) {
 	if !s.enabled {
 		return
