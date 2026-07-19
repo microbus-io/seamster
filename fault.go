@@ -16,8 +16,6 @@ limitations under the License.
 
 package seamster
 
-import "strings"
-
 // A fault makes a consult site MISBEHAVE. The host consults it where it affects with [Seamster.IsFault]; a test
 // arms it with [Seamster.Inject]. Faults are usually SCOPED: the consult site appends an identifier so a test
 // targets one entity (one task, one URL, one message) rather than "the next thing that happens". Both sides take
@@ -34,10 +32,7 @@ func (s *Seamster) IsFault(faultName string, scope ...string) bool {
 	if !s.enabled {
 		return false
 	}
-	key := faultName
-	if len(scope) > 0 {
-		key += ":" + strings.Join(scope, ":")
-	}
+	key := scopedKey(faultName, scope)
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	n := s.faults[key]
@@ -64,10 +59,7 @@ func (s *Seamster) InjectN(n int, faultName string, scope ...string) {
 	if !s.enabled || n <= 0 {
 		return
 	}
-	key := faultName
-	if len(scope) > 0 {
-		key += ":" + strings.Join(scope, ":")
-	}
+	key := scopedKey(faultName, scope)
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.faults == nil {
@@ -82,10 +74,7 @@ func (s *Seamster) Withdraw(faultName string, scope ...string) {
 	if !s.enabled {
 		return
 	}
-	key := faultName
-	if len(scope) > 0 {
-		key += ":" + strings.Join(scope, ":")
-	}
+	key := scopedKey(faultName, scope)
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	delete(s.faults, key)

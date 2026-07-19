@@ -22,12 +22,14 @@ the host constructs the [Seamster] enabled:
   - Fault injection makes a site MISBEHAVE: a test arms a named fault, the host consults it at the exact point it
     affects, and simulates an error, drop, or stale write that is otherwise hard to trigger on demand.
   - Execution checkpoints make a site OBSERVABLE and PAUSABLE: a test rendezvouses with the host's progress
-    ([Seamster.Wait]) or freezes the host at an exact point ([Seamster.Break] / [Seamster.Resume]).
+    ([Seamster.Waiter] / [Seamster.Wait] / [Seamster.WaitTimeout]), freezes the host at an exact point
+    ([Seamster.Break] / [Seamster.Resume]), or counts arrivals ([Seamster.Visits]).
 
 A "seam" is a place where a test can alter or observe behavior without editing the code in place; a Seamster is the
 object that works a host's seams. The host embeds one Seamster, plants consult sites ([Seamster.IsFault] /
 [Seamster.Checkpoint]) at the points they affect, and names the valid fault/checkpoint set next to those sites so a
-test cannot arm a fault no site consumes.
+test cannot arm a fault or checkpoint no site consumes. Both seams take an optional trailing scope, spelled the
+same way at the consult and at the arming, so a test targets one entity rather than the next thing that happens.
 
 Production inertness is by construction: every consult short-circuits on the enabled bool the host passes to [New]
 (typically testing.Testing()), so a disabled Seamster pays a single lock-free bool read per site and neither seam
@@ -36,11 +38,23 @@ without dragging in test-only dependencies.
 */
 package seamster
 
-import "sync"
+import (
+	"strings"
+	"sync"
+)
+
+// scopedKey is the one place either seam decides what a scoped key looks like, so a consult and the arming that
+// targets it cannot drift apart. Call it only after the enabled gate: a disabled Seamster allocates no key.
+func scopedKey(name string, scope []string) string {
+	if len(scope) == 0 {
+		return name
+	}
+	return name + ":" + strings.Join(scope, ":")
+}
 
 // Seamster works one host's instrumentation seams. It is safe for concurrent use. The zero value is a disabled
-// Seamster; construct one with [New]. A single Seamster is meant to be embedded per host instance (one per engine,
-// one per connector, ...), not shared as a package global, so distinct hosts arm and consult independently.
+// Seamster; construct one with [New]. Embed one Seamster per host instance rather than
+// sharing a package global, so distinct hosts arm and consult independently.
 type Seamster struct {
 	// enabled gates every consult. When false, IsFault and Checkpoint return before touching the lock or the
 	// maps, so a production host pays one bool read per site. Set once at construction and never mutated.

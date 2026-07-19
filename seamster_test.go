@@ -91,20 +91,114 @@ func TestSeamster_ScopedFaultsAreIndependent(t *testing.T) {
 	}
 }
 
-func TestSeamster_WaitRendezvous(t *testing.T) {
+func TestSeamster_WaiterRendezvous(t *testing.T) {
 	s := New(true)
-	reached := make(chan struct{})
-	go func() {
-		s.Wait("cp")
-		close(reached)
-	}()
-	// Give the waiter a moment to register, then the host passes the checkpoint.
-	time.Sleep(10 * time.Millisecond)
+	// Arm first, then let the host pass the checkpoint - no goroutine and no sleep-to-register, because Waiter
+	// registers the waiter before it returns.
+	reached := s.Waiter("cp")
 	s.Checkpoint(context.Background(), "cp")
 	select {
 	case <-reached:
 	case <-time.After(time.Second):
-		t.Fatal("Wait did not observe the checkpoint")
+		t.Fatal("Waiter did not observe the checkpoint")
+	}
+}
+
+// The property Waiter exists for: a checkpoint the host passes between arming and receiving is still observed.
+// This test cannot be written against the blocking Wait - there the receive IS the arming, so the host's arrival
+// would be missed and the rendezvous would hang.
+func TestSeamster_WaiterArmedBeforeArrivalIsNotMissed(t *testing.T) {
+	s := New(true)
+	reached := s.Waiter("cp")
+
+	// The host arrives (and departs) entirely before anyone receives.
+	s.Checkpoint(context.Background(), "cp")
+	time.Sleep(10 * time.Millisecond)
+
+	select {
+	case <-reached:
+	default:
+		t.Fatal("a checkpoint reached after arming but before receiving was lost")
+	}
+}
+
+// A disabled Seamster must never block a receive, so host code carrying a wait cannot wedge in production.
+func TestSeamster_WaiterOnDisabledDoesNotBlock(t *testing.T) {
+	s := New(false)
+	select {
+	case <-s.Waiter("cp"):
+	case <-time.After(time.Second):
+		t.Fatal("Waiter blocked on a disabled Seamster")
+	}
+}
+
+// Wait must end on ctx rather than hang when the host never arrives, and must say which happened.
+func TestSeamster_WaitAbortsOnContext(t *testing.T) {
+	s := New(true)
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if s.Wait(ctx, "never") {
+		t.Fatal("Wait reported an arrival that never happened")
+	}
+	// An arrival still reports true even on an already-cancelled ctx. A plain two-case select would pick at
+	// random here and turn a checkpoint the host DID reach into an intermittent miss.
+	s.Break("cp")
+	go s.Checkpoint(context.Background(), "cp")
+	for s.Visits("cp") == 0 {
+		time.Sleep(time.Millisecond)
+	}
+	if !s.Wait(ctx, "cp") {
+		t.Fatal("Wait reported a miss for a checkpoint the host had reached")
+	}
+	s.Resume("cp")
+}
+
+func TestSeamster_WaitTimeoutBoundsTheWait(t *testing.T) {
+	s := New(true)
+	if s.WaitTimeout(context.Background(), 20*time.Millisecond, "never") {
+		t.Fatal("WaitTimeout reported an arrival that never happened")
+	}
+	// A disabled Seamster has nothing to wait for, so it reports arrival immediately rather than burning the
+	// timeout - host code carrying a wait must not stall in production.
+	if !New(false).WaitTimeout(context.Background(), time.Hour, "never") {
+		t.Fatal("WaitTimeout on a disabled Seamster did not report immediately")
+	}
+}
+
+// Scoped checkpoints are independent keys, and a scoped fire does not wake an unscoped waiter - the same
+// contract faults carry, so the two seams are spelled and reasoned about the same way.
+func TestSeamster_ScopedCheckpointsAreIndependent(t *testing.T) {
+	s := New(true)
+	ctx := context.Background()
+
+	unscoped := s.Waiter("stopped")
+	other := s.Waiter("stopped", "flow-2", "failed")
+	target := s.Waiter("stopped", "flow-1", "completed")
+
+	s.Checkpoint(ctx, "stopped", "flow-1", "completed")
+
+	select {
+	case <-target:
+	default:
+		t.Fatal("a waiter scoped to the fired checkpoint was not woken")
+	}
+	select {
+	case <-other:
+		t.Fatal("a differently-scoped waiter was woken")
+	default:
+	}
+	select {
+	case <-unscoped:
+		t.Fatal("an unscoped waiter was woken by a scoped fire")
+	default:
+	}
+
+	// Visits counts per key, so the scoped arrival is invisible to the unscoped counter.
+	if got := s.Visits("stopped", "flow-1", "completed"); got != 1 {
+		t.Fatalf("expected 1 scoped visit, got %d", got)
+	}
+	if got := s.Visits("stopped"); got != 0 {
+		t.Fatalf("expected 0 unscoped visits, got %d", got)
 	}
 }
 
@@ -122,7 +216,7 @@ func TestSeamster_BreakpointFreezeAndRelease(t *testing.T) {
 
 	<-frozen
 	// Wait must return once the host is frozen at the breakpoint, even racing arrival.
-	s.Wait("cp")
+	s.Wait(context.Background(), "cp")
 
 	select {
 	case <-released:
@@ -155,7 +249,7 @@ func TestSeamster_BreakpointHoldsConcurrentArrivals(t *testing.T) {
 	}
 
 	// Wait returns as soon as the first of the fan-out arrives.
-	s.Wait("cp")
+	s.Wait(context.Background(), "cp")
 	select {
 	case <-released:
 		t.Fatal("a goroutine proceeded past the breakpoint before it was cleared")
@@ -202,8 +296,8 @@ func TestSeamster_VisitsCountsCheckpointArrivals(t *testing.T) {
 
 	// A visit is counted even when the arrival then blocks on a breakpoint.
 	s.Break("cp")
-	go s.Checkpoint(ctx, "cp") // reaches the checkpoint (counted), then blocks
-	s.Wait("cp")               // returns once frozen at the breakpoint
+	go s.Checkpoint(ctx, "cp")         // reaches the checkpoint (counted), then blocks
+	s.Wait(context.Background(), "cp") // returns once frozen at the breakpoint
 	if got := s.Visits("cp"); got != 4 {
 		t.Fatalf("a breakpoint-blocked arrival should still count; expected 4, got %d", got)
 	}

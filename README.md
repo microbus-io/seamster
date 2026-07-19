@@ -51,13 +51,15 @@ Test side:
 // Fault injection: arm a scoped fault to fire once (scope args match IsFault's).
 h.seams.Inject("transitionCommit", "Charge")
 
-// Rendezvous: block the test until the host reaches a checkpoint.
-h.seams.Wait("beforeTransitionTx")
+// Rendezvous: arm BEFORE the operation, receive after it, so the checkpoint cannot fire in the gap.
+reached := h.seams.Waiter("beforeTransitionTx")
+h.Process(ctx)
+<-reached
 
 // Freeze: drive a concurrent op into a precise window.
 h.seams.Break("beforeTransitionTx")
-go h.Process(ctx)          // runs into the breakpoint and blocks
-h.seams.Wait("beforeTransitionTx")  // returns once frozen
+go h.Process(ctx)                                  // runs into the breakpoint and blocks
+h.seams.Wait(ctx, "beforeTransitionTx")            // returns once frozen
 // ... run the racing operation while the host is held ...
 h.seams.Resume("beforeTransitionTx")
 
@@ -73,15 +75,17 @@ if h.seams.Visits("beforeTransitionTx") != 3 {
 |---|---|---|
 | `New(enabled bool)` | host | Construct a Seamster; inert when `enabled` is false. |
 | `Enabled() bool` | host | Skip building a scoped consult that would only feed `IsFault`. |
-| `IsFault(name, scope...) bool` | host | Consult a fault, consuming one fire. |
-| `Inject(name, scope...)` | test | Arm a fault once (additive); scope args match `IsFault`. |
-| `InjectN(n, name, scope...)` | test | Arm a fault n times (additive); scope args match `IsFault`. |
-| `Withdraw(name, scope...)` | test | Disarm a fault. |
-| `Checkpoint(ctx, name)` | host | Pass through a checkpoint; counts the visit, wakes waiters, honors a breakpoint. |
-| `Wait(name)` | test | Block until the host next reaches the checkpoint. |
-| `Break(name)` | test | Freeze the host at the checkpoint. |
-| `Resume(name)` | test | Unfreeze the host at the checkpoint. |
-| `Visits(name) int` | test | Count how many times the host has passed the checkpoint (monotonic; never blocks). |
+| `IsFault(faultName, scope...) bool` | host | Consult a fault, consuming one fire. |
+| `Inject(faultName, scope...)` | test | Arm a fault once (additive); scope args match `IsFault`. |
+| `InjectN(n, faultName, scope...)` | test | Arm a fault n times (additive); scope args match `IsFault`. |
+| `Withdraw(faultName, scope...)` | test | Disarm a fault. |
+| `Checkpoint(ctx, checkpointName)` | host | Pass through a checkpoint; counts the visit, wakes waiters, honors a breakpoint. |
+| `Waiter(checkpointName) <-chan struct{}` | test | Arm a waiter for the host's next arrival; the channel closes when it arrives. Does not block - arm before the triggering operation, receive after it. |
+| `Wait(ctx, checkpointName) bool` | test | Arm and block until the host arrives; reports whether it did, aborting on `ctx`. Only where the host is already running into the checkpoint. |
+| `WaitTimeout(ctx, checkpointName, timeout) bool` | test | `Wait` bounded by a duration - the common shape in a test. |
+| `Break(checkpointName)` | test | Freeze the host at the checkpoint. |
+| `Resume(checkpointName)` | test | Unfreeze the host at the checkpoint. |
+| `Visits(checkpointName) int` | test | Count how many times the host has passed the checkpoint (monotonic; never blocks). |
 
 Scoping: a fault is usually scoped so a test targets one entity rather than "the next thing that happens." The
 consult passes the scope to `IsFault`; the test arms the fault with the same scope args (`Inject`/`InjectN`/
