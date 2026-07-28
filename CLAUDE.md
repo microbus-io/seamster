@@ -13,6 +13,11 @@ seamster imports only the standard library, and that is load-bearing rather than
 consequence is that **no method can fail a test** — a bounded wait reports `bool` and the caller asserts. Do not
 "improve" this by taking a `*testing.T` or a `TestingT` interface.
 
+`Variable` is the entry point most likely to erode this, because it is the only one that carries data out of the
+host. The line it must not cross: record a value the host **already computes** for its own reasons, never one
+derived for the seam's benefit. A value computed solely so a test can assert on it has moved the assertion into
+production source, which is the thing the whole package is arranged to prevent.
+
 ## Why a rendezvous both returns a channel and blocks
 
 A rendezvous is two steps — *arm*, then *receive* — and fusing them is a correctness problem, not a style one. A
@@ -39,17 +44,68 @@ observation reliable, that is a leftover worth deleting.
 expires in the same instant — an intermittent false failure, in a package whose whole purpose is removing those.
 `TestSeamster_WaitAbortsOnContext` covers it; deleting the pre-check makes that test fail, so it is not decoration.
 
-## Scoping is one mechanism across both seams
+## Scoping is one mechanism across all three seams
 
-Faults and checkpoints scope identically, through `scopedKey`. That sharing is the point: a consult and the arming
-that targets it must build the same key, and three hand-rolled copies of the join (the state before it was
-extracted) is exactly how they drift apart. Build the key **after** the `enabled` gate at every site, so a
+Faults, checkpoints and variables scope identically, through `scopedKey`. That sharing is the point: a consult and
+the arming that targets it must build the same key, and hand-rolled copies of the join (the state before it was
+extracted) are exactly how they drift apart. Build the key **after** the `enabled` gate at every site, so a
 disabled Seamster allocates nothing.
 
 A scoped fire and an unscoped one are **different keys** — a scoped `Checkpoint` does not wake an unscoped waiter,
 and each key counts its own `Visits`. A host wanting both granularities fires both explicitly. This mirrors fault
 semantics exactly, which is why it is left as-is rather than made to cascade: cascading would make `Visits`
 ambiguous (does an unscoped count include scoped arrivals?) and split the two seams' behavior.
+
+## A variable overwrites, and holds no history
+
+`Variable` replaces the value under its key; there is no accumulating form, and adding one is the obvious wrong
+turn. Overwrite bounds the cost by the number of **distinct keys**, which the test controls through the scope it
+chooses. Appending would bound it by the number of **calls**, which the test does not control at all — a
+recording site sitting in a host's execution loop, exercised by a soak test, accumulates a slot per pass at a
+single key. That asymmetry is the whole argument: the growth an author can reason about versus the growth they
+cannot.
+
+Nothing is lost that composition does not return. The value a history would be wanted for is an intermediate one
+that a later pass overwrites, and the way to read it is to stop the host at the moment it holds: plant a
+`Checkpoint` beside the recording site, `Break` there, `Capture` while the host is frozen, `Resume`.
+`TestSeamster_VariableCapturedUnderABreakpoint` pins exactly that composition, so it is checkable rather than
+merely asserted here.
+
+## The variable seam owns no rendezvous
+
+`Variable` deliberately does **not** fire a checkpoint, and `Capture` never blocks. Fusing them would look
+economical — one namespace, `Visits` and `Waiter` working on variables for free — and it costs more than it
+saves: a recording would trip a breakpoint armed on the same name, `Visits` would count recordings alongside
+genuine checkpoint arrivals, and `Variable` would need a `ctx` at every call site to honor a freeze it has no
+business honoring.
+
+The reason it can stay unfused is that a variable is **state, not an edge**. A checkpoint arrival is gone the
+instant it happens, which is why that seam needs the arm-before-trigger discipline; a recorded value is still
+sitting there when a late `Capture` runs. Most captures therefore need no ordering at all — the host has
+finished the work under test by the time the test looks. The ones that do need ordering compose with the
+checkpoint seam, which already solves it correctly.
+
+## `Capture` returns `any`, not a generic
+
+The typed alternative — a package-level `Capture[T any](s *Seamster, ...) (T, bool)`, since Go has no generic
+methods — was weighed and dropped. It would be the only free function in a package where every entry point is a
+method on `Seamster`, and it buys less than it appears to: with `(any, bool)`, a **bare** type assertion
+(`v.(int)`) panics on a host-side type drift, and a panic in the test goroutine is a loud, correct failure. Only
+`v, _ := x.(int)` is silent, and a discarded type assertion is visible in review. The godoc spells out the bare
+form for this reason.
+
+## Two constraints that live at the recording site
+
+Both are the host's to honor; neither can be enforced from inside the package.
+
+**Wrap every `Variable` call in an `Enabled()` check.** Every other consult is free in production because its
+arguments are constants — the `enabled` read short-circuits before anything happens. `Variable` takes a value,
+and the conversion to the `any` parameter is performed by the **caller**, before the gate can be reached. An
+unguarded call therefore costs a production allocation on every pass, on whatever hot path it was planted in.
+
+**Record a value, never a reference to live state.** `mu` guards the map, not what a recorded pointer, slice, or
+map points at. The host goes on mutating that while a test reads it from another goroutine — a data race the
+guard cannot see and the race detector will. Record a scalar, or snapshot before recording.
 
 ## Breakpoints hold every arrival
 

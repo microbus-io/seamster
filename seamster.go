@@ -15,8 +15,8 @@ limitations under the License.
 */
 
 /*
-Package seamster provides two test-only instrumentation seams that a white-box test uses to exercise a host's
-recovery and race paths deterministically, without forging state or hammering on timing. Both are inert unless
+Package seamster provides three test-only instrumentation seams that a white-box test uses to exercise a host's
+recovery and race paths deterministically, without forging state or hammering on timing. All are inert unless
 the host constructs the [Seamster] enabled:
 
   - Fault injection makes a site MISBEHAVE: a test arms a named fault, the host consults it at the exact point it
@@ -24,17 +24,23 @@ the host constructs the [Seamster] enabled:
   - Execution checkpoints make a site OBSERVABLE and PAUSABLE: a test rendezvouses with the host's progress
     ([Seamster.Waiter] / [Seamster.Wait] / [Seamster.WaitTimeout]), freezes the host at an exact point
     ([Seamster.Break] / [Seamster.Resume]), or counts arrivals ([Seamster.Visits]).
+  - Recorded variables make a host-side VALUE readable: the host records what it has computed
+    ([Seamster.Variable]) and a test reads the last recording ([Seamster.Capture]) - for a value a test cannot
+    reach otherwise, such as one the host computes and consumes without ever storing it.
 
 A "seam" is a place where a test can alter or observe behavior without editing the code in place; a Seamster is the
 object that works a host's seams. The host embeds one Seamster, plants consult sites ([Seamster.IsFault] /
-[Seamster.Checkpoint]) at the points they affect, and names the valid fault/checkpoint set next to those sites so a
-test cannot arm a fault or checkpoint no site consumes. Both seams take an optional trailing scope, spelled the
-same way at the consult and at the arming, so a test targets one entity rather than the next thing that happens.
+[Seamster.Checkpoint] / [Seamster.Variable]) at the points they affect, and names the valid fault/checkpoint set
+next to those sites so a test cannot arm a fault or checkpoint no site consumes. All three seams take an optional
+trailing scope, spelled the same way at the consult and at the arming, so a test targets one entity rather than
+the next thing that happens.
 
 Production inertness is by construction: every consult short-circuits on the enabled bool the host passes to [New]
-(typically testing.Testing()), so a disabled Seamster pays a single lock-free bool read per site and neither seam
-can ever fire. The package imports only the standard library, so a host may embed it on a production hot path
-without dragging in test-only dependencies.
+(typically testing.Testing()), so a disabled Seamster pays a single lock-free bool read per site and no seam can
+ever fire. [Seamster.Variable] is the one site that needs the host's help to stay free - it takes a value, whose
+conversion to any happens before the gate is read - so those calls are wrapped in an [Seamster.Enabled] check.
+The package imports only the standard library, so a host may embed it on a production hot path without dragging
+in test-only dependencies.
 */
 package seamster
 
@@ -60,9 +66,9 @@ type Seamster struct {
 	// maps, so a production host pays one bool read per site. Set once at construction and never mutated.
 	enabled bool
 
-	// mu guards faults, waitFors, breakpoints, and visits together. One lock keeps the arm/consult/wake
-	// operations across both seams mutually consistent - e.g. Checkpoint bumping the visit count, waking
-	// waiters, and marking a breakpoint hit under a single hold.
+	// mu guards faults, waitFors, breakpoints, visits, and variables together. One lock keeps the
+	// arm/consult/wake operations across the seams mutually consistent - e.g. Checkpoint bumping the visit
+	// count, waking waiters, and marking a breakpoint hit under a single hold.
 	mu sync.Mutex
 
 	// faults maps an armed fault key to its remaining fire count. A key is the fault name plus any scope,
@@ -78,6 +84,11 @@ type Seamster struct {
 	// visits counts how many times the host has passed each named checkpoint, bumped by Checkpoint and read
 	// by Visits. Monotonic for the Seamster's lifetime - never reset.
 	visits map[string]int
+
+	// variables holds the last value the host recorded under each variable key, written by Variable and read
+	// by Capture. Overwritten rather than appended, so a recording site on a hot path costs one entry no
+	// matter how often it runs.
+	variables map[string]any
 }
 
 // New returns a Seamster. When enabled is false every consult is inert, so a host passes its own under-test

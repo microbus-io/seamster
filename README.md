@@ -4,17 +4,20 @@
 that a white-box test hooks into to drive failure and timing paths deterministically. A "seam" is a place where a
 test can alter or observe behavior without editing the code in place; a `Seamster` is the object that works them.
 
-It has two halves:
+It has three halves:
 
 - **Fault injection** makes a site *misbehave*. A test arms a named fault; the host consults it at the exact point
   it affects and simulates an error, drop, or stale write that is otherwise hard to trigger on demand.
 - **Execution checkpoints** make a site *observable and pausable*. A test rendezvouses with the host's progress,
   freezes the host at an exact point (so a concurrent operation can be driven into a precise window with no timing
   hammer), or simply counts how many times the host has passed the point.
+- **Recorded variables** make a host-side *value* readable. The host records what it has computed; a test reads
+  the last recording — for a value a test cannot reach otherwise, such as one the host computes and consumes
+  without ever storing it.
 
-Both are **inert in production by construction**: every consult short-circuits on the `enabled` bool the host
+All are **inert in production by construction**: every consult short-circuits on the `enabled` bool the host
 passes to `New` (typically `testing.Testing()`), so a disabled `Seamster` pays a single lock-free bool read per
-site and neither seam can ever fire. The package imports only the standard library, so a host may embed it on a
+site and no seam can ever fire. The package imports only the standard library, so a host may embed it on a
 production hot path without pulling in test-only dependencies.
 
 ## Usage
@@ -43,6 +46,12 @@ if h.seams.IsFault("transitionCommit", taskName) {
 
 // Mark this point observable/pausable.
 h.seams.Checkpoint(ctx, "beforeTransitionTx")
+
+// Publish a value a test cannot otherwise see. Guarded, because the value is boxed at the call site,
+// before the enabled gate is read.
+if h.seams.Enabled() {
+    h.seams.Variable("chosenBand", band)
+}
 ```
 
 Test side:
@@ -67,6 +76,14 @@ h.seams.Resume("beforeTransitionTx")
 if h.seams.Visits("beforeTransitionTx") != 3 {
     t.Fatalf("expected 3 attempts, got %d", h.seams.Visits("beforeTransitionTx"))
 }
+
+// Capture: read the last value the host recorded. Assert the type WITHOUT the comma-ok, so a drift in
+// the host's type fails loudly instead of yielding a zero value the test goes on to assert against.
+v, ok := h.seams.Capture("chosenBand")
+if !ok {
+    t.Fatal("host never recorded chosenBand")
+}
+band := v.(int)
 ```
 
 ## API
@@ -86,8 +103,16 @@ if h.seams.Visits("beforeTransitionTx") != 3 {
 | `Break(checkpointName)` | test | Freeze the host at the checkpoint. |
 | `Resume(checkpointName)` | test | Unfreeze the host at the checkpoint. |
 | `Visits(checkpointName) int` | test | Count how many times the host has passed the checkpoint (monotonic; never blocks). |
+| `Variable(variableName, value, scope...)` | host | Record the current value of a host-side variable, replacing the previous recording. Wrap in an `Enabled()` check. |
+| `Capture(variableName, scope...) (any, bool)` | test | Read the last recorded value, and whether one was ever recorded. Never blocks. |
 
 Scoping: a fault is usually scoped so a test targets one entity rather than "the next thing that happens." The
 consult passes the scope to `IsFault`; the test arms the fault with the same scope args (`Inject`/`InjectN`/
 `Withdraw` all join scope the same way), so it is spelled one way at both ends. Unscoped (process-wide) faults
-take no scope.
+take no scope. Checkpoints and variables scope through the same join.
+
+Recording **overwrites**: a variable holds the last value recorded under it, never a history, so a site on a hot
+path may record on every pass at a cost bounded by the number of distinct keys. `Capture` has no rendezvous of
+its own — it reads whatever has been recorded by the moment it runs, which is all most reads need. Where a read
+must be *ordered* against the host, plant a checkpoint beside the recording site and compose: freeze, capture,
+resume.

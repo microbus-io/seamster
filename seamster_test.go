@@ -343,3 +343,132 @@ func TestSeamster_ConcurrentArmAndConsult(t *testing.T) {
 	}
 	wg.Wait()
 }
+
+func TestSeamster_CaptureReadsTheRecordedValue(t *testing.T) {
+	s := New(true)
+
+	// Nothing recorded yet: ok distinguishes an unreached site from a recorded zero value.
+	if _, ok := s.Capture("band"); ok {
+		t.Fatal("Capture reported a value for a variable never recorded")
+	}
+	s.Variable("band", 0)
+	v, ok := s.Capture("band")
+	if !ok {
+		t.Fatal("Capture did not report a recorded zero value")
+	}
+	if v.(int) != 0 {
+		t.Fatalf("expected the recorded 0, got %v", v)
+	}
+
+	// Reading is passive: it consumes nothing and can be repeated.
+	if _, ok := s.Capture("band"); !ok {
+		t.Fatal("Capture consumed the recording")
+	}
+	// Distinct names are independent.
+	if _, ok := s.Capture("other"); ok {
+		t.Fatal("unrelated variable reported a value")
+	}
+}
+
+func TestSeamster_VariableOverwritesRatherThanAccumulates(t *testing.T) {
+	s := New(true)
+	// A recording site on a hot path records on every pass; only the last value survives.
+	for i := range 1000 {
+		s.Variable("band", i)
+	}
+	v, ok := s.Capture("band")
+	if !ok {
+		t.Fatal("no value recorded")
+	}
+	if v.(int) != 999 {
+		t.Fatalf("expected the last recorded value 999, got %v", v)
+	}
+	// One key, one entry - the cost is bounded by distinct keys, not by how often the site runs.
+	s.mu.Lock()
+	n := len(s.variables)
+	s.mu.Unlock()
+	if n != 1 {
+		t.Fatalf("expected 1000 recordings to hold 1 entry, got %d", n)
+	}
+}
+
+func TestSeamster_ScopedVariablesAreIndependent(t *testing.T) {
+	s := New(true)
+	s.Variable("band", "unscoped")
+	s.Variable("band", "one", "1")
+	s.Variable("band", "two", "2")
+
+	for _, tc := range []struct {
+		want  string
+		scope []string
+	}{
+		{"unscoped", nil},
+		{"one", []string{"1"}},
+		{"two", []string{"2"}},
+	} {
+		v, ok := s.Capture("band", tc.scope...)
+		if !ok {
+			t.Fatalf("no value recorded for scope %v", tc.scope)
+		}
+		if v.(string) != tc.want {
+			t.Fatalf("scope %v: expected %q, got %q", tc.scope, tc.want, v)
+		}
+	}
+	// A scoped recording does not satisfy a differently-scoped capture.
+	if _, ok := s.Capture("band", "3"); ok {
+		t.Fatal("an unrecorded scope reported a value")
+	}
+}
+
+func TestSeamster_VariableOnDisabledRecordsNothing(t *testing.T) {
+	d := New(false)
+	d.Variable("band", 7)
+	v, ok := d.Capture("band")
+	if ok {
+		t.Fatal("disabled Seamster reported a recorded variable")
+	}
+	if v != nil {
+		t.Fatalf("disabled Capture should yield a nil value, got %v", v)
+	}
+}
+
+func TestSeamster_VariableCapturedUnderABreakpoint(t *testing.T) {
+	// The composition the variable seam relies on instead of owning a rendezvous: a checkpoint beside the
+	// recording site orders the capture against the host, so an intermediate value a later pass would
+	// overwrite is read while the host is held.
+	s := New(true)
+	ctx := context.Background()
+	s.Break("recorded")
+
+	go func() {
+		for i := range 3 {
+			s.Variable("band", i)
+			s.Checkpoint(ctx, "recorded") // freezes here on the first pass, holding band=0
+		}
+	}()
+
+	if !s.WaitTimeout(ctx, time.Second, "recorded") {
+		t.Fatal("host never reached the checkpoint beside the recording site")
+	}
+	v, ok := s.Capture("band")
+	if !ok {
+		t.Fatal("no value recorded by the time the host froze")
+	}
+	if v.(int) != 0 {
+		t.Fatalf("expected the intermediate value 0 while frozen, got %v", v)
+	}
+	s.Resume("recorded")
+}
+
+func TestSeamster_ConcurrentRecordAndCapture(t *testing.T) {
+	// Exercised under -race: recording and capturing from many goroutines must not race. Scalars only - a
+	// recorded reference would race on its pointee, which this guard cannot cover.
+	s := New(true)
+	var wg sync.WaitGroup
+	for i := range 50 {
+		wg.Add(2)
+		go func() { defer wg.Done(); s.Variable("band", i) }()
+		go func() { defer wg.Done(); s.Capture("band") }()
+	}
+	wg.Wait()
+}
