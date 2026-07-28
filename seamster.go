@@ -31,32 +31,29 @@ the host constructs the [Seamster] enabled:
 A "seam" is a place where a test can alter or observe behavior without editing the code in place; a Seamster is the
 object that works a host's seams. The host embeds one Seamster, plants consult sites ([Seamster.IsFault] /
 [Seamster.Checkpoint] / [Seamster.Variable]) at the points they affect, and names the valid fault/checkpoint set
-next to those sites so a test cannot arm a fault or checkpoint no site consumes. All three seams take an optional
-trailing scope, spelled the same way at the consult and at the arming, so a test targets one entity rather than
-the next thing that happens.
+next to those sites so a test cannot arm a fault or checkpoint no site consumes.
+
+# Names
+
+Every seam is addressed by a plain string name. A consult and the arming aimed at it meet on that string and
+nothing else. A name identifying one entity - a particular task, URL, or shard, so a test targets it rather than
+the next thing that happens - is best built by a function defined once and called at both ends, so the two
+cannot drift apart:
+
+	func taskFault(task string) string { return "task:" + task }
 
 Production inertness is by construction: every consult short-circuits on the enabled bool the host passes to [New]
 (typically testing.Testing()), so a disabled Seamster pays a single lock-free bool read per site and no seam can
-ever fire. [Seamster.Variable] is the one site that needs the host's help to stay free - it takes a value, whose
-conversion to any happens before the gate is read - so those calls are wrapped in an [Seamster.Enabled] gate.
+ever fire. What the host must watch is the step BEFORE the gate, which is the caller's own work: a constant name
+costs nothing, but a name assembled at the call site is assembled on every pass whether or not the seams are
+live, as is the value handed to [Seamster.Variable]. Wrap those sites in an [Seamster.Enabled] check.
+
 The package imports only the standard library, so a host may embed it on a production hot path without dragging
 in test-only dependencies.
 */
 package seamster
 
-import (
-	"strings"
-	"sync"
-)
-
-// scopedKey is the one place any seam decides what a scoped key looks like. Call it only after the enabled
-// gate, so a disabled Seamster allocates no key.
-func scopedKey(name string, scope []string) string {
-	if len(scope) == 0 {
-		return name
-	}
-	return name + ":" + strings.Join(scope, ":")
-}
+import "sync"
 
 // Seamster works one host's instrumentation seams. It is safe for concurrent use. The zero value is a disabled
 // Seamster; construct one with [New]. Embed one Seamster per host instance rather than
@@ -71,7 +68,7 @@ type Seamster struct {
 	// it per map would tear that.
 	mu sync.Mutex
 
-	// Every map below is keyed by scopedKey. faults holds an armed fault's REMAINING fire count, decremented
+	// Every map below is keyed by the seam's name. faults holds an armed fault's REMAINING fire count, decremented
 	// by each consult; an exhausted key is deleted rather than left at zero, so presence means armed.
 	faults map[string]int
 
@@ -96,9 +93,13 @@ func New(enabled bool) *Seamster {
 }
 
 // Enabled reports whether the seams are live, so a host can skip work that would only feed a consult and would
-// otherwise be paid for in production. Two cases need it: building a scoped consult (a state read, a key
-// concatenation) that only [Seamster.IsFault] or [Seamster.Checkpoint] would use, and every
-// [Seamster.Variable] call, whose value is converted to any by the caller before the gate is reached.
+// otherwise be paid for in production. Anything the caller builds before the call is such work: a computed name
+// (a concatenation, a closure, a struct boxed into the name parameter), a state read that only the name or the
+// fault decision needs, and the value handed to [Seamster.Variable]. A constant string name needs no guard.
+//
+//	if h.seams.Enabled() {
+//		h.seams.Checkpoint(ctx, shardKey{h.shard})
+//	}
 func (s *Seamster) Enabled() bool {
 	return s.enabled
 }

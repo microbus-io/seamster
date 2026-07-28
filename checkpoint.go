@@ -37,29 +37,26 @@ type breakpoint struct {
 // [Seamster.WaitTimeout]), freezes the host there ([Seamster.Break] / [Seamster.Resume]), or counts arrivals
 // ([Seamster.Visits]).
 //
-// Free in production: it returns on the enabled bool read, before any lock or key build. When enabled it counts
-// the visit, wakes any waiters, and - if a breakpoint is armed - blocks until [Seamster.Resume], or until ctx is
-// done, so a stuck test or a shutdown can never wedge the host goroutine forever.
+// Free in production: it returns on the enabled bool read, before any lock. When enabled it counts the visit,
+// wakes any waiters, and - if a breakpoint is armed - blocks until [Seamster.Resume], or until ctx is done, so a
+// stuck test or a shutdown can never wedge the host goroutine forever.
 //
-// Optional scope args are joined into the key the same way at every method here, so a test targets one entity
-// rather than the next thing that happens. A scoped fire and an unscoped one are DIFFERENT checkpoints: passing
-// scope does not also wake an unscoped waiter, and each key counts its own visits, so a host wanting both
-// granularities fires both.
-func (s *Seamster) Checkpoint(ctx context.Context, checkpointName string, scope ...string) {
+// Distinct names are DIFFERENT checkpoints: firing one does not wake a waiter armed on another, and each keeps
+// its own visit count. A host wanting both a fleet-wide and a per-entity granularity fires both.
+func (s *Seamster) Checkpoint(ctx context.Context, checkpointName string) {
 	if !s.enabled {
 		return
 	}
-	key := scopedKey(checkpointName, scope)
 	s.mu.Lock()
 	if s.visits == nil {
 		s.visits = make(map[string]int)
 	}
-	s.visits[key]++
-	for _, ch := range s.waitFors[key] {
+	s.visits[checkpointName]++
+	for _, ch := range s.waitFors[checkpointName] {
 		close(ch)
 	}
-	delete(s.waitFors, key)
-	bp := s.breakpoints[key]
+	delete(s.waitFors, checkpointName)
+	bp := s.breakpoints[checkpointName]
 	if bp != nil && !bp.hitClosed {
 		// First arrival marks the breakpoint hit; later arrivals (concurrent ones racing this same lock hold, or
 		// sequential ones before Resume disarms the entry) just join the freeze without re-closing hit.
@@ -89,16 +86,16 @@ func (s *Seamster) Checkpoint(ctx context.Context, checkpointName string, scope 
 //
 // The channel is already closed if a breakpoint is currently holding the host at name, and on a disabled
 // Seamster - so a receive never blocks in production.
-func (s *Seamster) Waiter(checkpointName string, scope ...string) <-chan struct{} {
+
+func (s *Seamster) Waiter(checkpointName string) <-chan struct{} {
 	ch := make(chan struct{})
 	if !s.enabled {
 		close(ch)
 		return ch
 	}
-	key := scopedKey(checkpointName, scope)
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if bp := s.breakpoints[key]; bp != nil {
+	if bp := s.breakpoints[checkpointName]; bp != nil {
 		select {
 		case <-bp.hit:
 			close(ch) // host already frozen at this breakpoint
@@ -109,7 +106,7 @@ func (s *Seamster) Waiter(checkpointName string, scope ...string) <-chan struct{
 	if s.waitFors == nil {
 		s.waitFors = make(map[string][]chan struct{})
 	}
-	s.waitFors[key] = append(s.waitFors[key], ch)
+	s.waitFors[checkpointName] = append(s.waitFors[checkpointName], ch)
 	return ch
 }
 
@@ -122,8 +119,9 @@ func (s *Seamster) Waiter(checkpointName string, scope ...string) <-chan struct{
 //
 // Use it where the host is ALREADY running into the checkpoint: frozen at a breakpoint, or driven from another
 // goroutine. If the caller's own next statement is the trigger, this cannot arm in time - use [Seamster.Waiter].
-func (s *Seamster) Wait(ctx context.Context, checkpointName string, scope ...string) bool {
-	reached := s.Waiter(checkpointName, scope...)
+
+func (s *Seamster) Wait(ctx context.Context, checkpointName string) bool {
+	reached := s.Waiter(checkpointName)
 	// Prefer the arrival when both are ready. A lone two-case select picks at random, so a checkpoint the host
 	// DID reach would report as a miss whenever ctx expires in the same instant.
 	select {
@@ -141,10 +139,10 @@ func (s *Seamster) Wait(ctx context.Context, checkpointName string, scope ...str
 
 // WaitTimeout is [Seamster.Wait] bounded by a duration - the usual shape in a test, where the bound is "this
 // long" rather than a deadline inherited from elsewhere. ctx still aborts, so a cancelled parent ends it early.
-func (s *Seamster) WaitTimeout(ctx context.Context, timeout time.Duration, checkpointName string, scope ...string) bool {
+func (s *Seamster) WaitTimeout(ctx context.Context, checkpointName string, timeout time.Duration) bool {
 	ctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
-	return s.Wait(ctx, checkpointName, scope...)
+	return s.Wait(ctx, checkpointName)
 }
 
 // Break arms a breakpoint so the host blocks the next time it reaches the named checkpoint, until
@@ -160,16 +158,16 @@ func (s *Seamster) WaitTimeout(ctx context.Context, timeout time.Duration, check
 // Reach for it only to genuinely HOLD the host. A rendezvous is already race-free on its own, and freezing
 // perturbs the timing under test - a Break armed merely to make an observation reliable is doing nothing a
 // [Seamster.Waiter] would not.
-func (s *Seamster) Break(checkpointName string, scope ...string) {
+
+func (s *Seamster) Break(checkpointName string) {
 	if !s.enabled {
 		return
 	}
-	key := scopedKey(checkpointName, scope)
 	s.mu.Lock()
 	if s.breakpoints == nil {
 		s.breakpoints = make(map[string]*breakpoint)
 	}
-	s.breakpoints[key] = &breakpoint{release: make(chan struct{}), hit: make(chan struct{})}
+	s.breakpoints[checkpointName] = &breakpoint{release: make(chan struct{}), hit: make(chan struct{})}
 	s.mu.Unlock()
 }
 
@@ -178,25 +176,25 @@ func (s *Seamster) Break(checkpointName string, scope ...string) {
 // can be read repeatedly. The count is monotonic for the Seamster's lifetime, so capture a baseline first to
 // assert on visits accrued within a window. Zero for a checkpoint never reached, and always zero on a disabled
 // Seamster.
-func (s *Seamster) Visits(checkpointName string, scope ...string) int {
+
+func (s *Seamster) Visits(checkpointName string) int {
 	if !s.enabled {
 		return 0
 	}
-	key := scopedKey(checkpointName, scope)
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return s.visits[key]
+	return s.visits[checkpointName]
 }
 
 // Resume releases the host frozen at the named breakpoint and disarms it. A no-op if none is armed.
-func (s *Seamster) Resume(checkpointName string, scope ...string) {
+
+func (s *Seamster) Resume(checkpointName string) {
 	if !s.enabled {
 		return
 	}
-	key := scopedKey(checkpointName, scope)
 	s.mu.Lock()
-	bp := s.breakpoints[key]
-	delete(s.breakpoints, key)
+	bp := s.breakpoints[checkpointName]
+	delete(s.breakpoints, checkpointName)
 	s.mu.Unlock()
 	if bp != nil {
 		close(bp.release)

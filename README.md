@@ -39,8 +39,8 @@ func NewHost() *Host {
 Production consult sites (free when disabled):
 
 ```go
-// Make this write misbehave when a test arms the fault, scoped to one task.
-if h.seams.IsFault("transitionCommit", taskName) {
+// Make this write misbehave when a test arms the fault, targeting one task.
+if h.seams.IsFault(taskFault(taskName)) {
     return errors.New("injected fault")
 }
 
@@ -57,8 +57,8 @@ if h.seams.Enabled() {
 Test side:
 
 ```go
-// Fault injection: arm a scoped fault to fire once (scope args match IsFault's).
-h.seams.Inject("transitionCommit", "Charge")
+// Fault injection: arm a fault to fire once, naming the same entity the consult names.
+h.seams.Inject(taskFault("Charge"))
 
 // Rendezvous: arm BEFORE the operation, receive after it, so the checkpoint cannot fire in the gap.
 reached := h.seams.Waiter("beforeTransitionTx")
@@ -91,11 +91,11 @@ band := v.(int)
 | Method | Side | Purpose |
 |---|---|---|
 | `New(enabled bool)` | host | Construct a Seamster; inert when `enabled` is false. |
-| `Enabled() bool` | host | Skip building a scoped consult that would only feed `IsFault`. |
-| `IsFault(faultName, scope...) bool` | host | Consult a fault, consuming one fire. |
-| `Inject(faultName, scope...)` | test | Arm a fault once (additive); scope args match `IsFault`. |
-| `InjectN(n, faultName, scope...)` | test | Arm a fault n times (additive); scope args match `IsFault`. |
-| `Withdraw(faultName, scope...)` | test | Disarm a fault. |
+| `Enabled() bool` | host | Skip building anything that only a consult would use. |
+| `IsFault(faultName) bool` | host | Consult a fault, consuming one fire. |
+| `Inject(faultName)` | test | Arm a fault once (additive). |
+| `InjectN(faultName, n)` | test | Arm a fault n times (additive). |
+| `Withdraw(faultName)` | test | Disarm a fault. |
 | `Checkpoint(ctx, checkpointName)` | host | Pass through a checkpoint; counts the visit, wakes waiters, honors a breakpoint. |
 | `Waiter(checkpointName) <-chan struct{}` | test | Arm a waiter for the host's next arrival; the channel closes when it arrives. Does not block - arm before the triggering operation, receive after it. |
 | `Wait(ctx, checkpointName) bool` | test | Arm and block until the host arrives; reports whether it did, aborting on `ctx`. Only where the host is already running into the checkpoint. |
@@ -103,16 +103,32 @@ band := v.(int)
 | `Break(checkpointName)` | test | Freeze the host at the checkpoint. |
 | `Resume(checkpointName)` | test | Unfreeze the host at the checkpoint. |
 | `Visits(checkpointName) int` | test | Count how many times the host has passed the checkpoint (monotonic; never blocks). |
-| `Variable(variableName, value, scope...)` | host | Record the current value of a host-side variable, replacing the previous recording. Wrap in an `Enabled()` check. |
-| `Capture(variableName, scope...) (any, bool)` | test | Read the last recorded value, and whether one was ever recorded. Never blocks. |
+| `Variable(variableName, value)` | host | Record the current value of a host-side variable, replacing the previous recording. Wrap in an `Enabled()` check. |
+| `Capture(variableName) (any, bool)` | test | Read the last recorded value, and whether one was ever recorded. Never blocks. |
 
-Scoping: a fault is usually scoped so a test targets one entity rather than "the next thing that happens." The
-consult passes the scope to `IsFault`; the test arms the fault with the same scope args (`Inject`/`InjectN`/
-`Withdraw` all join scope the same way), so it is spelled one way at both ends. Unscoped (process-wide) faults
-take no scope. Checkpoints and variables scope through the same join.
+## Names
+
+Every name above is a plain `string`, and a consult and the arming aimed at it meet on that string and nothing
+else. A name identifying one entity, so a test targets it rather than "the next thing that happens," is best
+built by a function the host writes once and calls at both ends, so the two cannot drift apart:
+
+```go
+func taskFault(task string) string { return "task:" + task }
+
+// consult:  h.seams.IsFault(taskFault(taskName))
+// arming:   h.seams.Inject(taskFault("Charge"))
+```
+
+Distinct names are distinct keys, with no cascade: firing `stopName("flow-1")` does not wake a waiter armed on
+`"stopped"`, and each keeps its own visit count. A site wanting both granularities fires both.
+
+On a hot path, mind what the name costs to assemble, since the caller assembles it before the gate is reached —
+it is paid whether or not the seams are live. A constant name is free. An assembled one costs one allocation,
+inline or through a helper. `Variable` costs one even with a constant name, because its value is boxed — which
+is why every `Variable` call is wrapped. `if h.seams.Enabled() { ... }` around the call elides all of it.
 
 Recording **overwrites**: a variable holds the last value recorded under it, never a history, so a site on a hot
-path may record on every pass at a cost bounded by the number of distinct keys. `Capture` has no rendezvous of
+path may record on every pass at a cost bounded by the number of distinct names. `Capture` has no rendezvous of
 its own — it reads whatever has been recorded by the moment it runs, which is all most reads need. Where a read
 must be *ordered* against the host, plant a checkpoint beside the recording site and compose: freeze, capture,
 resume.

@@ -23,11 +23,17 @@ import (
 	"time"
 )
 
+// A composite name built by a shared function, called at both the consult and the arming so the two cannot
+// drift apart - the shape a host is expected to use for a name that identifies one entity.
+func taskFault(task string) string { return "task:" + task }
+
+func stopName(flow string) string { return "stopped:" + flow }
+
 func TestSeamster_DisabledIsInert(t *testing.T) {
 	s := New(false)
 	// Arming has no effect because consults short-circuit on the disabled gate.
 	s.Inject("boom")
-	s.InjectN(5, "boom")
+	s.InjectN("boom", 5)
 	if s.IsFault("boom") {
 		t.Fatal("disabled Seamster fired a fault")
 	}
@@ -61,7 +67,7 @@ func TestSeamster_FaultFiresOnce(t *testing.T) {
 
 func TestSeamster_FaultCountAndClear(t *testing.T) {
 	s := New(true)
-	s.InjectN(3, "boom")
+	s.InjectN("boom", 3)
 	fires := 0
 	for s.IsFault("boom") {
 		fires++
@@ -73,21 +79,26 @@ func TestSeamster_FaultCountAndClear(t *testing.T) {
 		t.Fatalf("expected 3 fires, got %d", fires)
 	}
 
-	s.InjectN(5, "boom")
+	s.InjectN("boom", 5)
 	s.Withdraw("boom")
 	if s.IsFault("boom") {
 		t.Fatal("cleared fault still fired")
 	}
 }
 
-func TestSeamster_ScopedFaultsAreIndependent(t *testing.T) {
+func TestSeamster_NamesTargetingDifferentEntitiesAreIndependent(t *testing.T) {
 	s := New(true)
-	s.Inject("task", "Charge")
-	if s.IsFault("task", "Refund") {
-		t.Fatal("fault scoped to Charge fired for Refund")
+	s.Inject(taskFault("Charge"))
+	if s.IsFault(taskFault("Refund")) {
+		t.Fatal("a fault named for Charge fired for Refund")
 	}
-	if !s.IsFault("task", "Charge") {
-		t.Fatal("fault scoped to Charge did not fire for Charge")
+	if !s.IsFault(taskFault("Charge")) {
+		t.Fatal("a fault named for Charge did not fire for Charge")
+	}
+	// The helper only builds a string, so a site spelling that string literally finds the same fault.
+	s.Inject(taskFault("Charge"))
+	if !s.IsFault("task:Charge") {
+		t.Fatal("the literal form of the same name did not find the fault")
 	}
 }
 
@@ -155,50 +166,50 @@ func TestSeamster_WaitAbortsOnContext(t *testing.T) {
 
 func TestSeamster_WaitTimeoutBoundsTheWait(t *testing.T) {
 	s := New(true)
-	if s.WaitTimeout(context.Background(), 20*time.Millisecond, "never") {
+	if s.WaitTimeout(context.Background(), "never", 20*time.Millisecond) {
 		t.Fatal("WaitTimeout reported an arrival that never happened")
 	}
 	// A disabled Seamster has nothing to wait for, so it reports arrival immediately rather than burning the
 	// timeout - host code carrying a wait must not stall in production.
-	if !New(false).WaitTimeout(context.Background(), time.Hour, "never") {
+	if !New(false).WaitTimeout(context.Background(), "never", time.Hour) {
 		t.Fatal("WaitTimeout on a disabled Seamster did not report immediately")
 	}
 }
 
-// Scoped checkpoints are independent keys, and a scoped fire does not wake an unscoped waiter - the same
-// contract faults carry, so the two seams are spelled and reasoned about the same way.
-func TestSeamster_ScopedCheckpointsAreIndependent(t *testing.T) {
+// Names built for different entities are independent keys, and firing the entity-specific one does not wake a
+// waiter armed on the broad one - the same contract faults carry, so the seams are reasoned about alike.
+func TestSeamster_CheckpointNamesAreIndependent(t *testing.T) {
 	s := New(true)
 	ctx := context.Background()
 
-	unscoped := s.Waiter("stopped")
-	other := s.Waiter("stopped", "flow-2", "failed")
-	target := s.Waiter("stopped", "flow-1", "completed")
+	broad := s.Waiter("stopped")
+	other := s.Waiter(stopName("flow-2"))
+	target := s.Waiter(stopName("flow-1"))
 
-	s.Checkpoint(ctx, "stopped", "flow-1", "completed")
+	s.Checkpoint(ctx, stopName("flow-1"))
 
 	select {
 	case <-target:
 	default:
-		t.Fatal("a waiter scoped to the fired checkpoint was not woken")
+		t.Fatal("a waiter armed on the fired name was not woken")
 	}
 	select {
 	case <-other:
-		t.Fatal("a differently-scoped waiter was woken")
+		t.Fatal("a waiter armed on a different name was woken")
 	default:
 	}
 	select {
-	case <-unscoped:
-		t.Fatal("an unscoped waiter was woken by a scoped fire")
+	case <-broad:
+		t.Fatal("a waiter on the broad name was woken by an entity-specific fire")
 	default:
 	}
 
-	// Visits counts per key, so the scoped arrival is invisible to the unscoped counter.
-	if got := s.Visits("stopped", "flow-1", "completed"); got != 1 {
-		t.Fatalf("expected 1 scoped visit, got %d", got)
+	// Visits counts per key, so the entity-specific arrival is invisible to the broad counter.
+	if got := s.Visits(stopName("flow-1")); got != 1 {
+		t.Fatalf("expected 1 visit on the fired name, got %d", got)
 	}
 	if got := s.Visits("stopped"); got != 0 {
-		t.Fatalf("expected 0 unscoped visits, got %d", got)
+		t.Fatalf("expected 0 visits on the broad name, got %d", got)
 	}
 }
 
@@ -392,31 +403,32 @@ func TestSeamster_VariableOverwritesRatherThanAccumulates(t *testing.T) {
 	}
 }
 
-func TestSeamster_ScopedVariablesAreIndependent(t *testing.T) {
+func TestSeamster_VariableNamesAreIndependent(t *testing.T) {
 	s := New(true)
-	s.Variable("band", "unscoped")
-	s.Variable("band", "one", "1")
-	s.Variable("band", "two", "2")
+	bandOf := func(shard string) string { return "band:" + shard }
+	s.Variable("band", "broad")
+	s.Variable(bandOf("1"), "one")
+	s.Variable(bandOf("2"), "two")
 
 	for _, tc := range []struct {
-		want  string
-		scope []string
+		name string
+		want string
 	}{
-		{"unscoped", nil},
-		{"one", []string{"1"}},
-		{"two", []string{"2"}},
+		{"band", "broad"},
+		{bandOf("1"), "one"},
+		{bandOf("2"), "two"},
+		{"band:2", "two"}, // the string is the identity, whatever built it
 	} {
-		v, ok := s.Capture("band", tc.scope...)
+		v, ok := s.Capture(tc.name)
 		if !ok {
-			t.Fatalf("no value recorded for scope %v", tc.scope)
+			t.Fatalf("no value recorded under %v", tc.want)
 		}
 		if v.(string) != tc.want {
-			t.Fatalf("scope %v: expected %q, got %q", tc.scope, tc.want, v)
+			t.Fatalf("expected %q, got %q", tc.want, v)
 		}
 	}
-	// A scoped recording does not satisfy a differently-scoped capture.
-	if _, ok := s.Capture("band", "3"); ok {
-		t.Fatal("an unrecorded scope reported a value")
+	if _, ok := s.Capture(bandOf("3")); ok {
+		t.Fatal("an unrecorded name reported a value")
 	}
 }
 
@@ -447,7 +459,7 @@ func TestSeamster_VariableCapturedUnderABreakpoint(t *testing.T) {
 		}
 	}()
 
-	if !s.WaitTimeout(ctx, time.Second, "recorded") {
+	if !s.WaitTimeout(ctx, "recorded", time.Second) {
 		t.Fatal("host never reached the checkpoint beside the recording site")
 	}
 	v, ok := s.Capture("band")

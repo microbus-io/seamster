@@ -29,6 +29,12 @@ Rules that follow from the split:
   in an `Enabled()` check"); the *argument* for why the API forces it is this file's.
 - **Developer prose never restates the code.** If a sentence is recoverable by reading the three lines beneath
   it, delete it.
+- **Describe what IS, never what changed.** No "X was built and removed", "this replaced Y", "there is no longer
+  a Z" — git holds that, and prose retelling it ages into a lie at the next edit while costing the reader the
+  current picture. A rejected alternative earns a place only when it is a trap someone would otherwise walk
+  into, and then it is written as a **standing constraint with its evidence** — "Do not soften this into a
+  general `fmt` fallback: `%v` renders `Point{1,2}` and `Size{1,2}` as the same string" — not as a chronology.
+  The test is whether a reader who never saw the other version could *act* on the sentence.
 - **Embedded prose must be location-sensitive.** A comment that would read just as well here belongs here —
   proximity to the code is the only thing it has that this file does not, so it had better be using it. The
   clearest failure is a **free-floating block comment at the top of a file**: Go attaches it to no declaration,
@@ -58,17 +64,15 @@ wait that arms and blocks in one call can only arm **after** the operation it wa
 arrival in that gap is lost forever. Hence `Waiter` returns the channel: the caller arms before the trigger and
 receives after, leaving no gap.
 
-The two ways of papering over a fused wait were both tried in a consuming test suite and both cost something
-real. A goroutine calling a blocking wait merely **moves** the race (it may not have registered before the host
-arrives) and leaks on timeout. A breakpoint closes the race honestly but **freezes the host**, perturbing the
-timing under test and obliging a `Resume`. Because `Waiter` is race-free on its own, `Break` is now only for
-genuinely *holding* the host while a racing operation runs — if you find `Break` armed purely to make an
-observation reliable, that is a leftover worth deleting.
+Neither way of papering over a fused wait works. A goroutine calling a blocking wait merely **moves** the race
+(it may not have registered before the host arrives) and leaks on timeout. A breakpoint closes the race honestly
+but **freezes the host**, perturbing the timing under test and obliging a `Resume`. Because `Waiter` is race-free
+on its own, `Break` is only for genuinely *holding* the host while a racing operation runs — a `Break` armed
+purely to make an observation reliable is doing nothing a `Waiter` would not, and is worth deleting.
 
 `Wait` and `WaitTimeout` still exist because the fused shape is correct and simpler whenever the host is
 *already* running into the checkpoint (frozen at a breakpoint, or driven from another goroutine). They take
-`ctx` — matching `Checkpoint`, so an abort is spelled one way throughout — and `WaitTimeout` takes its timeout
-**before** the name purely so `scope ...string` stays trailing and variadic like everywhere else.
+`ctx` — matching `Checkpoint`, so an abort is spelled one way throughout.
 
 ## `Wait` prefers the arrival over ctx, deliberately
 
@@ -77,22 +81,58 @@ observation reliable, that is a leftover worth deleting.
 expires in the same instant — an intermittent false failure, in a package whose whole purpose is removing those.
 `TestSeamster_WaitAbortsOnContext` covers it; deleting the pre-check makes that test fail, so it is not decoration.
 
-## Scoping is one mechanism across all three seams
+## A name is a plain string
 
-Faults, checkpoints and variables scope identically, through `scopedKey`. That sharing is the point: a consult and
-the arming that targets it must build the same key, and hand-rolled copies of the join (the state before it was
-extracted) are exactly how they drift apart. Build the key **after** the `enabled` gate at every site, so a
-disabled Seamster allocates nothing.
+Every seam keys on the `string` it is given, and nothing stands between the two. A flexible `name any` — resolved
+through a chain of `string` / `func() string` / `fmt.Stringer` / `encoding.TextMarshaler` — buys nothing worth its
+price here, so do not reintroduce one. It costs a boxing allocation the `string` parameter does not, it admits
+values that cannot become a stable name (`%v` renders `Point{1,2}` and `Size{1,2}` as the same `{1 2}`; a pointer
+in a struct field renders as a per-run address), and defending against those means a runtime panic where a
+`string` parameter gets a compile error instead.
 
-A scoped fire and an unscoped one are **different keys** — a scoped `Checkpoint` does not wake an unscoped waiter,
-and each key counts its own `Visits`. A host wanting both granularities fires both explicitly. This mirrors fault
-semantics exactly, which is why it is left as-is rather than made to cascade: cascading would make `Visits`
-ambiguous (does an unscoped count include scoped arrivals?) and split the two seams' behavior.
+The drift it was meant to prevent — a consult and its arming disagreeing on how a composite name is spelled — is
+prevented by a function the host writes once and calls at both ends:
+
+```go
+func taskFault(task string) string { return "task:" + task }
+```
+
+**The name comes first in every signature**, after `ctx` where there is one, and any modifier follows it:
+`InjectN(name, n)`, `WaitTimeout(ctx, name, timeout)`, `Variable(name, value)`. A new method putting its
+modifier first would be the only one, for no reason a caller could infer.
+
+Distinct names are **different keys**, with no cascade between a broad name and an entity-specific one: firing
+`"stopped:flow-1"` does not wake a waiter on `"stopped"`, and each counts its own `Visits`. A host wanting both
+granularities fires both. Do not add a cascade: it makes `Visits` ambiguous (does the broad count include the
+specific arrivals?) and would need defining separately for every seam.
+
+## What a name costs, measured
+
+Assembling a name happens at the **call site, before the gate**, so it is the host's cost whether or not the
+seams are live. Measured with `testing.AllocsPerRun` against a **disabled** Seamster, `task` a non-constant
+string:
+
+| Call site | allocs/op |
+|---|---|
+| `Checkpoint(ctx, "XY")` — constant | **0** |
+| `if Enabled() { ... }` — any name | **0** |
+| `Checkpoint(ctx, "a:"+task)` | 1 |
+| `Checkpoint(ctx, taskFault(task))` — shared helper | 1 |
+| `Variable("x", task)` — constant name, boxed value | 1 |
+| `if Enabled() { Variable("x", task) }` | **0** |
+
+A constant name is free, which covers most sites and needs no guard. Anything assembled costs the string it
+builds — one allocation, whether spelled inline or through a helper, since the helper returns the same string
+the concat would have. `Variable` always costs one even with a constant name, because its value is boxed, which
+is why its godoc mandates the guard unconditionally.
+
+The `Enabled()` guard is the only thing that reaches zero on a hot assembled site. Do not quietly drop it to
+tidy a call up.
 
 ## A variable overwrites, and holds no history
 
 `Variable` replaces the value under its key; there is no accumulating form, and adding one is the obvious wrong
-turn. Overwrite bounds the cost by the number of **distinct keys**, which the test controls through the scope it
+turn. Overwrite bounds the cost by the number of **distinct keys**, which the test controls through the names it
 chooses. Appending would bound it by the number of **calls**, which the test does not control at all — a
 recording site sitting in a host's execution loop, exercised by a soak test, accumulates a slot per pass at a
 single key. That asymmetry is the whole argument: the growth an author can reason about versus the growth they
@@ -120,25 +160,20 @@ checkpoint seam, which already solves it correctly.
 
 ## `Capture` returns `any`, not a generic
 
-The typed alternative — a package-level `Capture[T any](s *Seamster, ...) (T, bool)`, since Go has no generic
-methods — was weighed and dropped. It would be the only free function in a package where every entry point is a
-method on `Seamster`, and it buys less than it appears to: with `(any, bool)`, a **bare** type assertion
+Do not replace this with a typed `Capture[T any](s *Seamster, ...) (T, bool)` — necessarily a package-level
+function, since Go has no generic methods. It would be the only free function in a package where every entry
+point is a method on `Seamster`, and it buys less than it appears to: with `(any, bool)`, a **bare** type assertion
 (`v.(int)`) panics on a host-side type drift, and a panic in the test goroutine is a loud, correct failure. Only
 `v, _ := x.(int)` is silent, and a discarded type assertion is visible in review. The godoc spells out the bare
 form for this reason.
 
-## Two constraints that live at the recording site
+## Record a value, never a reference to live state
 
-Both are the host's to honor; neither can be enforced from inside the package.
-
-**Wrap every `Variable` call in an `Enabled()` check.** Every other consult is free in production because its
-arguments are constants — the `enabled` read short-circuits before anything happens. `Variable` takes a value,
-and the conversion to the `any` parameter is performed by the **caller**, before the gate can be reached. An
-unguarded call therefore costs a production allocation on every pass, on whatever hot path it was planted in.
-
-**Record a value, never a reference to live state.** `mu` guards the map, not what a recorded pointer, slice, or
-map points at. The host goes on mutating that while a test reads it from another goroutine — a data race the
-guard cannot see and the race detector will. Record a scalar, or snapshot before recording.
+`mu` guards the map, not what a recorded pointer, slice, or map points at. The host goes on mutating that while
+a test reads it from another goroutine — a data race the guard cannot see and the race detector will. Record a
+scalar, or snapshot before recording. The package cannot enforce this; it is the recording site's to honor, as
+is the `Enabled()` guard, which `Variable` needs at every site rather than only at computed-name ones because
+its *value* parameter is boxed too.
 
 ## Breakpoints hold every arrival
 
