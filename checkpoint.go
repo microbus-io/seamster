@@ -21,33 +21,6 @@ import (
 	"time"
 )
 
-// Where a fault makes a site misbehave, a checkpoint makes a site OBSERVABLE and PAUSABLE. The host passes through
-// a named checkpoint by calling [Seamster.Checkpoint]; a test drives it three ways:
-//
-//   - Rendezvous - wait for the host to reach the checkpoint. [Seamster.Waiter] arms a waiter and returns a
-//     channel to receive on; [Seamster.Wait] arms and blocks; [Seamster.WaitTimeout] arms and blocks with a
-//     bound. All arm for the host's NEXT arrival, so a checkpoint already passed does not re-fire.
-//   - Freeze - [Seamster.Break] holds the host at the checkpoint until [Seamster.Resume] clears it, so a test
-//     can run a racing operation while the host sits at an exact point.
-//   - Count - [Seamster.Visits] reports how many times the host has passed the checkpoint ("the retry ran
-//     exactly 3 times"). Passive: no arming, never blocks.
-//
-// Checkpoints scope like faults: every method takes trailing scope args, joined into the key the same way at both
-// ends, so a test targets one entity rather than the next thing that happens. A scoped fire and an unscoped one
-// are DIFFERENT checkpoints - passing scope does not also wake an unscoped waiter, and each key counts its own
-// visits - so a host wanting both fires both. ([Seamster.WaitTimeout] takes its timeout before the name to keep
-// the scope trailing and variadic, as it is everywhere else.)
-//
-// Choosing a rendezvous is a question about the caller. Use Waiter when the caller's OWN next statement is what
-// drives the host to the checkpoint - only it can arm before that statement runs. Use Wait or WaitTimeout when
-// the host is already running into the checkpoint: frozen at a breakpoint, or driven from another goroutine.
-//
-// Rendezvous and freeze compose to drive a concurrent operation into a precise window with no timing hammer:
-// Break, start the host operation, wait for it to freeze there, run the racing operation, Resume. A waiter armed
-// for a checkpoint already holding the host fires immediately, so this is race-free whichever happens first.
-// Break is for genuinely HOLDING the host, though - a rendezvous alone is already race-free, and freezing
-// perturbs the timing under test.
-
 // breakpoint is one armed breakpoint: release is closed by Resume to let the frozen host proceed; hit is closed
 // by the host when it reaches the checkpoint and is about to block, so a rendezvous armed after the host froze
 // still observes the arrival instead of hanging.
@@ -59,10 +32,19 @@ type breakpoint struct {
 	hitClosed bool
 }
 
-// Checkpoint is the host-side consult at an instrumented site, and the only one a host calls. Free in production:
-// it returns on the enabled bool read, before any lock or key build. When enabled it counts the visit, wakes any
-// waiters, and - if a breakpoint is armed - blocks until [Seamster.Resume], or until ctx is done, so a stuck test
-// or a shutdown can never wedge the host goroutine forever.
+// Checkpoint is the host-side consult at an instrumented site, and the only one a host calls. It makes the site
+// OBSERVABLE and PAUSABLE: a test rendezvouses with the host's arrival ([Seamster.Waiter] / [Seamster.Wait] /
+// [Seamster.WaitTimeout]), freezes the host there ([Seamster.Break] / [Seamster.Resume]), or counts arrivals
+// ([Seamster.Visits]).
+//
+// Free in production: it returns on the enabled bool read, before any lock or key build. When enabled it counts
+// the visit, wakes any waiters, and - if a breakpoint is armed - blocks until [Seamster.Resume], or until ctx is
+// done, so a stuck test or a shutdown can never wedge the host goroutine forever.
+//
+// Optional scope args are joined into the key the same way at every method here, so a test targets one entity
+// rather than the next thing that happens. A scoped fire and an unscoped one are DIFFERENT checkpoints: passing
+// scope does not also wake an unscoped waiter, and each key counts its own visits, so a host wanting both
+// granularities fires both.
 func (s *Seamster) Checkpoint(ctx context.Context, checkpointName string, scope ...string) {
 	if !s.enabled {
 		return
@@ -95,8 +77,8 @@ func (s *Seamster) Checkpoint(ctx context.Context, checkpointName string, scope 
 }
 
 // Waiter registers a waiter for the named checkpoint and returns a channel closed when the host reaches it. It
-// does not block: arming and receiving are separate steps, which is the whole point. Arm before the operation
-// that triggers the checkpoint, receive after it:
+// does not block: arming and receiving are separate steps. Arm before the operation that triggers the
+// checkpoint, receive after it:
 //
 //	reached := s.Waiter("beforeCommit")
 //	host.DoTheThing()
@@ -169,6 +151,15 @@ func (s *Seamster) WaitTimeout(ctx context.Context, timeout time.Duration, check
 // [Seamster.Resume] releases it. It holds every goroutine that reaches the checkpoint while armed, not only the
 // first, so a fan-out can be gathered at one point and released together by a single Resume; a rendezvous
 // returns as soon as the first of them arrives.
+//
+// It composes with a rendezvous to drive a concurrent operation into a precise window with no timing hammer:
+// Break, start the host operation, wait for it to freeze there, run the racing operation, Resume. A waiter armed
+// for a checkpoint that is already holding the host fires immediately, so this is race-free whichever happens
+// first.
+//
+// Reach for it only to genuinely HOLD the host. A rendezvous is already race-free on its own, and freezing
+// perturbs the timing under test - a Break armed merely to make an observation reliable is doing nothing a
+// [Seamster.Waiter] would not.
 func (s *Seamster) Break(checkpointName string, scope ...string) {
 	if !s.enabled {
 		return

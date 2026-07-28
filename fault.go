@@ -16,18 +16,18 @@ limitations under the License.
 
 package seamster
 
-// A fault makes a consult site MISBEHAVE. The host consults it where it affects with [Seamster.IsFault]; a test
-// arms it with [Seamster.Inject]. Faults are usually SCOPED: the consult site appends an identifier so a test
-// targets one entity (one task, one URL, one message) rather than "the next thing that happens". Both sides take
-// the scope as trailing args and join it the same way, so the scope is spelled one way at both ends:
-// s.IsFault("executeTask", taskName) is armed by s.Inject("executeTask", "Charge"). A few faults are
-// process-wide and take no scope.
-
-// IsFault reports whether the named fault is armed, consuming one fire. It is the only consult entry point and is
-// free in production: it returns on the enabled bool read before any lock or key build. Optional scope args target
-// the fault (a task name, a URL, ...) and are joined into the key, but only once the enabled gate has
-// passed, so a scoped consult on a disabled Seamster allocates no throwaway key. To keep a fault armed for the rest
-// of a test (until [Seamster.Withdraw]), inject a large count, e.g. s.InjectN(math.MaxInt, name).
+// IsFault reports whether the named fault is armed, consuming one fire, and makes the site around it MISBEHAVE -
+// simulating an error, drop, or stale write that is otherwise hard to trigger on demand. It is the only consult
+// entry point and is free in production: it returns on the enabled bool read before any lock or key build.
+//
+// Optional scope args target the fault (a task name, a URL, ...) and are joined into the key, but only once the
+// enabled gate has passed, so a scoped consult on a disabled Seamster allocates no throwaway key. A fault is
+// usually scoped, so a test targets one entity rather than the next thing that happens; the scope is spelled the
+// same way at the consult and at the arming, so s.IsFault("executeTask", taskName) is armed by
+// s.Inject("executeTask", "Charge"). A scoped fault and an unscoped one are different faults.
+//
+// To keep a fault armed for the rest of a test (until [Seamster.Withdraw]), inject a large count, e.g.
+// s.InjectN(math.MaxInt, name).
 func (s *Seamster) IsFault(faultName string, scope ...string) bool {
 	if !s.enabled {
 		return false

@@ -38,7 +38,7 @@ the next thing that happens.
 Production inertness is by construction: every consult short-circuits on the enabled bool the host passes to [New]
 (typically testing.Testing()), so a disabled Seamster pays a single lock-free bool read per site and no seam can
 ever fire. [Seamster.Variable] is the one site that needs the host's help to stay free - it takes a value, whose
-conversion to any happens before the gate is read - so those calls are wrapped in an [Seamster.Enabled] check.
+conversion to any happens before the gate is read - so those calls are wrapped in an [Seamster.Enabled] gate.
 The package imports only the standard library, so a host may embed it on a production hot path without dragging
 in test-only dependencies.
 */
@@ -49,8 +49,8 @@ import (
 	"sync"
 )
 
-// scopedKey is the one place either seam decides what a scoped key looks like, so a consult and the arming that
-// targets it cannot drift apart. Call it only after the enabled gate: a disabled Seamster allocates no key.
+// scopedKey is the one place any seam decides what a scoped key looks like. Call it only after the enabled
+// gate, so a disabled Seamster allocates no key.
 func scopedKey(name string, scope []string) string {
 	if len(scope) == 0 {
 		return name
@@ -62,17 +62,17 @@ func scopedKey(name string, scope []string) string {
 // Seamster; construct one with [New]. Embed one Seamster per host instance rather than
 // sharing a package global, so distinct hosts arm and consult independently.
 type Seamster struct {
-	// enabled gates every consult. When false, IsFault and Checkpoint return before touching the lock or the
-	// maps, so a production host pays one bool read per site. Set once at construction and never mutated.
+	// enabled is set once at construction and never mutated, which is what lets every consult read it without
+	// the lock.
 	enabled bool
 
-	// mu guards faults, waitFors, breakpoints, visits, and variables together. One lock keeps the
-	// arm/consult/wake operations across the seams mutually consistent - e.g. Checkpoint bumping the visit
-	// count, waking waiters, and marking a breakpoint hit under a single hold.
+	// mu guards every map below TOGETHER. One lock is what keeps operations spanning two of them consistent -
+	// Checkpoint bumps a visit count, wakes waiters, and marks a breakpoint hit under a single hold. Splitting
+	// it per map would tear that.
 	mu sync.Mutex
 
-	// faults maps an armed fault key to its remaining fire count. A key is the fault name plus any scope,
-	// joined with ":" - IsFault, Inject, and Withdraw all build it the same way.
+	// Every map below is keyed by scopedKey. faults holds an armed fault's REMAINING fire count, decremented
+	// by each consult; an exhausted key is deleted rather than left at zero, so presence means armed.
 	faults map[string]int
 
 	// waitFors holds tests blocked in Wait(name), woken by the host's next Checkpoint(name).
@@ -81,13 +81,11 @@ type Seamster struct {
 	// breakpoints holds armed Break(name) freezes, released by Resume(name).
 	breakpoints map[string]*breakpoint
 
-	// visits counts how many times the host has passed each named checkpoint, bumped by Checkpoint and read
-	// by Visits. Monotonic for the Seamster's lifetime - never reset.
+	// visits is monotonic for the Seamster's lifetime - never reset, which is why a test asserting on a window
+	// captures a baseline first.
 	visits map[string]int
 
-	// variables holds the last value the host recorded under each variable key, written by Variable and read
-	// by Capture. Overwritten rather than appended, so a recording site on a hot path costs one entry no
-	// matter how often it runs.
+	// variables holds only the LAST value recorded under each key; a second recording drops the first.
 	variables map[string]any
 }
 
@@ -97,8 +95,10 @@ func New(enabled bool) *Seamster {
 	return &Seamster{enabled: enabled}
 }
 
-// Enabled reports whether the seams are live. A host uses it to skip building a scoped consult (a state read, a
-// key concatenation) that would only feed IsFault, so the setup work is also elided in production.
+// Enabled reports whether the seams are live, so a host can skip work that would only feed a consult and would
+// otherwise be paid for in production. Two cases need it: building a scoped consult (a state read, a key
+// concatenation) that only [Seamster.IsFault] or [Seamster.Checkpoint] would use, and every
+// [Seamster.Variable] call, whose value is converted to any by the caller before the gate is reached.
 func (s *Seamster) Enabled() bool {
 	return s.enabled
 }

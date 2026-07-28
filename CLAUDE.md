@@ -1,10 +1,43 @@
 # seamster — design notes
 
-> Load when: editing anything in this package. Godoc here is written for **library users** (what the API does,
-> how to call it); this file holds the **why** — the decisions a maintainer needs and a user does not.
+> Load when: editing anything in this package.
 
-Keep both audiences straight. Godoc must not carry build rationale, rejected alternatives, or examples borrowed
-from any consuming project — a user cannot see those and should not have to read past them. This file may.
+## Documentation conventions
+
+Four places carry prose, and each has exactly one reader. Know which before writing a line.
+
+**Written for the agent USING the module:**
+
+- **`README.md`** — orientation: what the seams are, what each one is for, and the shapes a caller writes. The
+  only doc read before any source is opened.
+- **Godoc** — the package comment and every exported symbol (type, method, constant, variable): what it does,
+  what to pass, what comes back, what the caller must hold up. The how-to-USE-it altitude, never the
+  how-it-works one.
+
+**Written for the agent DEVELOPING the module:**
+
+- **`CLAUDE.md`** (this file) — the design rationale: why a mechanism is shaped this way, which alternatives were
+  weighed and lost, which invariants are load-bearing, which test pins each one. **Most developer prose belongs
+  here.**
+- **Private comments** — unexported identifiers, and comments inside function bodies. They live in the code
+  **because they are location-sensitive**: they say something a maintainer needs *at that line* and nowhere else.
+
+Rules that follow from the split:
+
+- **Godoc carries no rationale**, no rejected alternatives, and no examples borrowed from a consuming project — a
+  user cannot see any of that and should not have to read past it. The *instruction* is godoc's ("wrap this call
+  in an `Enabled()` check"); the *argument* for why the API forces it is this file's.
+- **Developer prose never restates the code.** If a sentence is recoverable by reading the three lines beneath
+  it, delete it.
+- **Embedded prose must be location-sensitive.** A comment that would read just as well here belongs here —
+  proximity to the code is the only thing it has that this file does not, so it had better be using it. The
+  clearest failure is a **free-floating block comment at the top of a file**: Go attaches it to no declaration,
+  so no user ever sees it in godoc, and it names no line, so it is not location-sensitive either. Its
+  user-facing half belongs in godoc or `README.md`; its rationale half belongs here.
+- **One home per fact, per audience.** `README.md` orients and godoc specifies, so the two overlap by design.
+  Within the developer half there is no such licence: a trap may be named twice — briefly at the line where
+  someone would walk into it, in full here — and nothing else may be. Two copies of an argument means one of
+  them is already going stale.
 
 ## The package owns mechanism, never assertion
 
