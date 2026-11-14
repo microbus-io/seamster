@@ -21,15 +21,12 @@ import (
 	"time"
 )
 
-// breakpoint is one armed breakpoint: release is closed by Resume to let the frozen host proceed; hit is closed
-// by the host when it reaches the checkpoint and is about to block, so a rendezvous armed after the host froze
-// still observes the arrival instead of hanging.
+// breakpoint is one armed breakpoint: release is closed by Resume to let every held goroutine proceed.
 type breakpoint struct {
 	release chan struct{}
-	hit     chan struct{}
-	// hitClosed guards against a double close of hit when several goroutines reach the same armed checkpoint
-	// concurrently. Read and written only under Seamster.mu.
-	hitClosed bool
+	// held counts the goroutines blocked on release right now, so a rendezvous armed after the host froze still
+	// observes the arrival. A count, not a channel closed on first arrival: see CLAUDE.md. Only under Seamster.mu.
+	held int
 }
 
 // Checkpoint is the host-side consult at an instrumented site, and the only one a host calls. It makes the site
@@ -57,11 +54,8 @@ func (s *Seamster) Checkpoint(ctx context.Context, checkpointName string) {
 	}
 	delete(s.waitFors, checkpointName)
 	bp := s.breakpoints[checkpointName]
-	if bp != nil && !bp.hitClosed {
-		// First arrival marks the breakpoint hit; later arrivals (concurrent ones racing this same lock hold, or
-		// sequential ones before Resume disarms the entry) just join the freeze without re-closing hit.
-		bp.hitClosed = true
-		close(bp.hit)
+	if bp != nil {
+		bp.held++
 	}
 	s.mu.Unlock()
 
@@ -70,6 +64,9 @@ func (s *Seamster) Checkpoint(ctx context.Context, checkpointName string) {
 		case <-bp.release:
 		case <-ctx.Done():
 		}
+		s.mu.Lock()
+		bp.held--
+		s.mu.Unlock()
 	}
 }
 
@@ -86,7 +83,6 @@ func (s *Seamster) Checkpoint(ctx context.Context, checkpointName string) {
 //
 // The channel is already closed if a breakpoint is currently holding the host at name, and on a disabled
 // Seamster - so a receive never blocks in production.
-
 func (s *Seamster) Waiter(checkpointName string) <-chan struct{} {
 	ch := make(chan struct{})
 	if !s.enabled {
@@ -95,13 +91,9 @@ func (s *Seamster) Waiter(checkpointName string) <-chan struct{} {
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if bp := s.breakpoints[checkpointName]; bp != nil {
-		select {
-		case <-bp.hit:
-			close(ch) // host already frozen at this breakpoint
-			return ch
-		default:
-		}
+	if bp := s.breakpoints[checkpointName]; bp != nil && bp.held > 0 {
+		close(ch) // host already frozen at this breakpoint
+		return ch
 	}
 	if s.waitFors == nil {
 		s.waitFors = make(map[string][]chan struct{})
@@ -119,7 +111,6 @@ func (s *Seamster) Waiter(checkpointName string) <-chan struct{} {
 //
 // Use it where the host is ALREADY running into the checkpoint: frozen at a breakpoint, or driven from another
 // goroutine. If the caller's own next statement is the trigger, this cannot arm in time - use [Seamster.Waiter].
-
 func (s *Seamster) Wait(ctx context.Context, checkpointName string) bool {
 	reached := s.Waiter(checkpointName)
 	// Prefer the arrival when both are ready. A lone two-case select picks at random, so a checkpoint the host
@@ -150,6 +141,9 @@ func (s *Seamster) WaitTimeout(ctx context.Context, checkpointName string, timeo
 // first, so a fan-out can be gathered at one point and released together by a single Resume; a rendezvous
 // returns as soon as the first of them arrives.
 //
+// To release concurrent arrivals one at a time instead, give each entity its own checkpoint name and break on
+// each; resume one, wait for it to reach a later checkpoint, then resume the next.
+//
 // It composes with a rendezvous to drive a concurrent operation into a precise window with no timing hammer:
 // Break, start the host operation, wait for it to freeze there, run the racing operation, Resume. A waiter armed
 // for a checkpoint that is already holding the host fires immediately, so this is race-free whichever happens
@@ -158,17 +152,22 @@ func (s *Seamster) WaitTimeout(ctx context.Context, checkpointName string, timeo
 // Reach for it only to genuinely HOLD the host. A rendezvous is already race-free on its own, and freezing
 // perturbs the timing under test - a Break armed merely to make an observation reliable is doing nothing a
 // [Seamster.Waiter] would not.
-
+//
+// Arming a breakpoint that is already armed is a no-op: whatever it holds stays held, and one Resume releases it.
 func (s *Seamster) Break(checkpointName string) {
 	if !s.enabled {
 		return
 	}
 	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.breakpoints[checkpointName] != nil {
+		// Replacing the entry would strand the goroutines it holds and hide them from Waiter. See CLAUDE.md.
+		return
+	}
 	if s.breakpoints == nil {
 		s.breakpoints = make(map[string]*breakpoint)
 	}
-	s.breakpoints[checkpointName] = &breakpoint{release: make(chan struct{}), hit: make(chan struct{})}
-	s.mu.Unlock()
+	s.breakpoints[checkpointName] = &breakpoint{release: make(chan struct{})}
 }
 
 // Visits reports how many times the host has passed the named checkpoint, counting a call that then blocked on a
@@ -176,7 +175,6 @@ func (s *Seamster) Break(checkpointName string) {
 // can be read repeatedly. The count is monotonic for the Seamster's lifetime, so capture a baseline first to
 // assert on visits accrued within a window. Zero for a checkpoint never reached, and always zero on a disabled
 // Seamster.
-
 func (s *Seamster) Visits(checkpointName string) int {
 	if !s.enabled {
 		return 0
@@ -187,7 +185,6 @@ func (s *Seamster) Visits(checkpointName string) int {
 }
 
 // Resume releases the host frozen at the named breakpoint and disarms it. A no-op if none is armed.
-
 func (s *Seamster) Resume(checkpointName string) {
 	if !s.enabled {
 		return

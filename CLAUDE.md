@@ -45,6 +45,10 @@ Rules that follow from the split:
   someone would walk into it, in full here — and nothing else may be. Two copies of an argument means one of
   them is already going stale.
 
+## Commit messages
+
+Do not add a `Co-Authored-By:` trailer, or any other attribution line, to a commit message.
+
 ## The package owns mechanism, never assertion
 
 seamster imports only the standard library, and that is load-bearing rather than incidental: a host embeds a
@@ -178,5 +182,28 @@ its *value* parameter is boxed too.
 ## Breakpoints hold every arrival
 
 An armed breakpoint freezes *every* goroutine reaching the checkpoint, not just the first, so a fan-out can be
-gathered at one point and released by a single `Resume`. `hitClosed` (under `mu`) exists because concurrent
-arrivals must not double-close `hit`. A rendezvous returns as soon as the first arrival lands.
+gathered at one point and released by a single `Resume`. A rendezvous returns as soon as the first arrival lands.
+
+What a rendezvous checks to see a hold already in place is `held`, the number of goroutines blocked **right
+now**, raised before the block and lowered after it. Do not replace it with a channel closed on the first
+arrival: a closed channel cannot reopen, so once a held goroutine leaves on its own ctx it goes on reporting a
+hold, and a test runs its racing operation against a host that is not frozen.
+`TestSeamster_BreakpointForgetsAnArrivalThatLeft` pins it.
+
+`Break` on a name already armed is a **no-op**, and must stay one. Every held goroutine is blocked on the armed
+entry's `release` channel and counted in its `held`, and `Resume` finds only the entry in the map — so
+overwriting the entry leaves the earlier arrivals waiting on a channel nothing will ever close, until their own
+ctx ends, and invisible to a rendezvous meanwhile. `TestSeamster_BreakRearmKeepsHeldArrivals` pins both halves.
+
+## Ordering concurrent arrivals is composed, not built in
+
+A test that must order arrivals at one site — branch L commits before R, with an operation landing while both
+are held — gives each entity its own checkpoint name and breaks on each, then resumes one, waits for it to reach
+a later checkpoint, and resumes the next. `TestSeamster_PerEntityBreakpointsOrderConcurrentArrivals` pins the
+composition.
+
+Do not add a gate — a hold that queues arrivals tagged with an identity key beside the name, and releases them
+selectively — on the strength of ordering. Per-entity breakpoints order every arrival a test can name. What a
+gate adds is control over arrivals it cannot name, such as a fan-out over generated IDs, and there it can only
+pick by arrival order: enough to serialize a race whose outcome the test does not care about, never enough to
+make a chosen arrival go first. Build it when a test needs that, not before.

@@ -132,3 +132,41 @@ path may record on every pass at a cost bounded by the number of distinct names.
 its own — it reads whatever has been recorded by the moment it runs, which is all most reads need. Where a read
 must be *ordered* against the host, plant a checkpoint beside the recording site and compose: freeze, capture,
 resume.
+
+## Ordering concurrent arrivals
+
+A breakpoint holds every goroutine that reaches it, and `Resume` releases them together. To release them one at
+a time — one branch commits before another, with a racing operation landing while both are held — give each
+entity its own checkpoint name and break on each. The host passes checkpoints named for the branch it is running:
+
+```go
+func commitName(branch string) string    { return "beforeCommit:" + branch }
+func committedName(branch string) string { return "committed:" + branch }
+
+if h.seams.Enabled() {
+    h.seams.Checkpoint(ctx, commitName(branch))
+}
+// ... commit ...
+if h.seams.Enabled() {
+    h.seams.Checkpoint(ctx, committedName(branch))
+}
+```
+
+The test holds both branches, then resumes them in the order it wants, waiting for each to finish before
+releasing the next:
+
+```go
+h.seams.Break(commitName("L"))
+h.seams.Break(commitName("R"))
+go h.RunBranches(ctx) // both run into their breakpoints
+if !h.seams.WaitTimeout(ctx, commitName("L"), time.Second) ||
+    !h.seams.WaitTimeout(ctx, commitName("R"), time.Second) {
+    t.Fatal("branches did not reach their commit")
+}
+// ... both held: run the racing operation ...
+
+committed := h.seams.Waiter(committedName("L")) // arm BEFORE the Resume that triggers it
+h.seams.Resume(commitName("L"))
+<-committed // L has committed; R is still held
+h.seams.Resume(commitName("R"))
+```

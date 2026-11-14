@@ -18,6 +18,7 @@ package seamster
 
 import (
 	"context"
+	"slices"
 	"sync"
 	"testing"
 	"time"
@@ -28,6 +29,9 @@ import (
 func taskFault(task string) string { return "task:" + task }
 
 func stopName(flow string) string { return "stopped:" + flow }
+
+func commitName(branch string) string    { return "beforeCommit:" + branch }
+func committedName(branch string) string { return "committed:" + branch }
 
 func TestSeamster_DisabledIsInert(t *testing.T) {
 	s := New(false)
@@ -281,6 +285,147 @@ func TestSeamster_BreakpointHoldsConcurrentArrivals(t *testing.T) {
 	}
 	if got := s.Visits("cp"); got != goroutines {
 		t.Fatalf("expected %d visits, got %d", goroutines, got)
+	}
+}
+
+func TestSeamster_BreakRearmKeepsHeldArrivals(t *testing.T) {
+	s := New(true)
+	s.Break("cp")
+
+	// The host's ctx never ends, so only Resume can release it.
+	released := make(chan struct{})
+	go func() {
+		s.Checkpoint(context.Background(), "cp")
+		close(released)
+	}()
+	if !s.WaitTimeout(context.Background(), "cp", time.Second) {
+		t.Fatal("host never reached the breakpoint")
+	}
+
+	// Re-arming while the host is held must not orphan it, and the arrival must still be visible as held.
+	s.Break("cp")
+	select {
+	case <-s.Waiter("cp"):
+	default:
+		t.Fatal("re-arming lost track of the arrival already held")
+	}
+
+	s.Resume("cp")
+	select {
+	case <-released:
+	case <-time.After(time.Second):
+		t.Fatal("Resume did not release a goroutine held before the breakpoint was re-armed")
+	}
+}
+
+func TestSeamster_BreakpointForgetsAnArrivalThatLeft(t *testing.T) {
+	s := New(true)
+	s.Break("cp")
+
+	ctx, cancel := context.WithCancel(context.Background())
+	left := make(chan struct{})
+	go func() {
+		s.Checkpoint(ctx, "cp")
+		close(left)
+	}()
+	if !s.WaitTimeout(context.Background(), "cp", time.Second) {
+		t.Fatal("host never reached the breakpoint")
+	}
+	cancel()
+	select {
+	case <-left:
+	case <-time.After(time.Second):
+		t.Fatal("host did not leave the breakpoint on ctx cancellation")
+	}
+
+	// Still armed, but holding nothing: a rendezvous must wait for the next arrival, for both a plain one and a
+	// re-armed one, rather than report the arrival that left.
+	select {
+	case <-s.Waiter("cp"):
+		t.Fatal("a rendezvous reported a hold after the only held arrival left")
+	default:
+	}
+	s.Break("cp")
+	select {
+	case <-s.Waiter("cp"):
+		t.Fatal("a rendezvous reported a hold after the only held arrival left")
+	default:
+	}
+
+	// The breakpoint still holds the next arrival.
+	released := make(chan struct{})
+	go func() {
+		s.Checkpoint(context.Background(), "cp")
+		close(released)
+	}()
+	if !s.WaitTimeout(context.Background(), "cp", time.Second) {
+		t.Fatal("next arrival never reached the breakpoint")
+	}
+	select {
+	case <-released:
+		t.Fatal("next arrival proceeded past the breakpoint before Resume")
+	case <-time.After(20 * time.Millisecond):
+	}
+	s.Resume("cp")
+	select {
+	case <-released:
+	case <-time.After(time.Second):
+		t.Fatal("Resume did not release the next arrival")
+	}
+}
+
+func TestSeamster_PerEntityBreakpointsOrderConcurrentArrivals(t *testing.T) {
+	s := New(true)
+	ctx := context.Background()
+
+	var mu sync.Mutex
+	var history []string
+	record := func(entry string) {
+		mu.Lock()
+		history = append(history, entry)
+		mu.Unlock()
+	}
+	// The host: two branches run the same code concurrently, each passing checkpoints named for itself.
+	branch := func(name string) {
+		s.Checkpoint(ctx, commitName(name))
+		record(name)
+		s.Checkpoint(ctx, committedName(name))
+	}
+
+	s.Break(commitName("L"))
+	s.Break(commitName("R"))
+	go branch("R")
+	go branch("L")
+	if !s.WaitTimeout(ctx, commitName("L"), time.Second) || !s.WaitTimeout(ctx, commitName("R"), time.Second) {
+		t.Fatal("both branches should be held before their commit")
+	}
+	record("op") // the racing operation lands while both branches are held
+
+	// Release L alone and wait for it to finish; R stays held throughout, so nothing it does can interleave.
+	committed := s.Waiter(committedName("L")) // armed before the Resume that triggers it
+	s.Resume(commitName("L"))
+	select {
+	case <-committed:
+	case <-time.After(time.Second):
+		t.Fatal("L did not commit after it was released")
+	}
+	select {
+	case <-s.Waiter(commitName("R")): // closed only while R is held there
+	default:
+		t.Fatal("releasing L also released R")
+	}
+	committed = s.Waiter(committedName("R"))
+	s.Resume(commitName("R"))
+	select {
+	case <-committed:
+	case <-time.After(time.Second):
+		t.Fatal("R did not commit after it was released")
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	if want := []string{"op", "L", "R"}; !slices.Equal(history, want) {
+		t.Fatalf("expected history %v, got %v", want, history)
 	}
 }
 

@@ -54,7 +54,7 @@ func (s *Seamster) Variable(variableName string, value any) {
 // recorded there. It never blocks, consumes nothing, and can be read repeatedly. The ok result distinguishes a
 // variable the host has not reached from one it recorded a zero value into. Always false on a disabled
 // Seamster.
-
+//
 // It has no rendezvous of its own: it reads whatever has been recorded by the moment it runs, which is all most
 // reads need, since the host has finished the work under test by the time the test looks. Where a read must be
 // ORDERED against the host - to catch an intermediate value a later pass would overwrite - plant a

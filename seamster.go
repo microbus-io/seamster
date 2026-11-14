@@ -64,8 +64,8 @@ type Seamster struct {
 	enabled bool
 
 	// mu guards every map below TOGETHER. One lock is what keeps operations spanning two of them consistent -
-	// Checkpoint bumps a visit count, wakes waiters, and marks a breakpoint hit under a single hold. Splitting
-	// it per map would tear that.
+	// Checkpoint bumps a visit count, wakes waiters, and counts an arrival held at a breakpoint under a single
+	// hold. Splitting it per map would tear that.
 	mu sync.Mutex
 
 	// Every map below is keyed by the seam's name. faults holds an armed fault's REMAINING fire count, decremented
@@ -93,12 +93,12 @@ func New(enabled bool) *Seamster {
 }
 
 // Enabled reports whether the seams are live, so a host can skip work that would only feed a consult and would
-// otherwise be paid for in production. Anything the caller builds before the call is such work: a computed name
-// (a concatenation, a closure, a struct boxed into the name parameter), a state read that only the name or the
-// fault decision needs, and the value handed to [Seamster.Variable]. A constant string name needs no guard.
+// otherwise be paid for in production. Anything the caller builds before the call is such work: an assembled
+// name (a concatenation, or a helper that returns one), a state read that only the name or the fault decision
+// needs, and the value handed to [Seamster.Variable]. A constant name needs no guard.
 //
 //	if h.seams.Enabled() {
-//		h.seams.Checkpoint(ctx, shardKey{h.shard})
+//		h.seams.Checkpoint(ctx, "shard:"+h.shard)
 //	}
 func (s *Seamster) Enabled() bool {
 	return s.enabled
